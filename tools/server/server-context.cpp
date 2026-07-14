@@ -569,12 +569,12 @@ struct model_fp {
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
                fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
                fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
-               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
-               fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
-               fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
-               fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
-               fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
-               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded;
+               fp_kv_full == o.fp_kv_full && fp_block == o.fp_block &&
+               fp_rope_scale == o.fp_rope_scale && fp_rope_base == o.fp_rope_base &&
+               fp_yarn_ext == o.fp_yarn_ext && fp_yarn_attn == o.fp_yarn_attn &&
+               fp_yarn_beta_fast == o.fp_yarn_beta_fast && fp_yarn_beta_slow == o.fp_yarn_beta_slow &&
+               fp_yarn_orig_ctx == o.fp_yarn_orig_ctx && fp_lora == o.fp_lora &&
+               fp_mmproj_loaded == o.fp_mmproj_loaded;
     }
 };
 
@@ -1754,12 +1754,16 @@ private:
     // call repeatedly for the cross-process refresh. Records the dir mtime so a refresh can cheaply
     // tell whether anything changed. CALLER MUST HOLD auto_idx.mtx.
     void auto_index_scan_locked() {
+        SRV_INF("auto cache: scanning directory %s\n", params_base.slot_save_path.c_str());
         std::error_code mec;
         const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
         if (!mec) {
             auto_idx.dir_mtime = dmt; // snapshot the dir mtime we are scanning at
         }
         std::error_code ec;
+        // First pass: collect all auto-*.bin files and check for orphans
+        std::unordered_set<std::string> bin_files;
+        std::unordered_set<std::string> meta_files;
         for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
              !ec && it != end; it.increment(ec)) {
             std::error_code fec;
@@ -1767,15 +1771,41 @@ private:
                 continue;
             }
             const std::string p = it->path().string();
-            // only our own state files: basename "auto-*.bin" (sidecars and temps skipped). Requiring
-            // the "auto-" basename prefix rejects foreign/manual .bin files BY NAME before we open any
-            // sidecar — the stated scan optimization.
             const std::string base = it->path().filename().string();
             if (base.rfind("auto-", 0) != 0) {
                 continue; // not one of ours
             }
-            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+            if (p.size() >= 9 && p.compare(p.size() - 9, 9, ".bin.meta") == 0) {
+                // Extract base name without .bin.meta
+                meta_files.insert(base.substr(0, base.size() - 9));
+            } else if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".bin") == 0) {
+                // Extract base name without .bin
+                bin_files.insert(base.substr(0, base.size() - 4));
+            }
+        }
+        // Check for orphans
+        for (const auto & b : bin_files) {
+            if (meta_files.find(b) == meta_files.end()) {
+                SRV_WRN("auto cache: orphan bin file (no .meta): auto-%s.bin\n", b.c_str());
+            }
+        }
+        for (const auto & b : meta_files) {
+            if (bin_files.find(b) == bin_files.end()) {
+                SRV_WRN("auto cache: orphan meta file (no .bin): auto-%s.bin.meta\n", b.c_str());
+            }
+        }
+        // Second pass: index bin files with valid .meta
+        ec.clear();
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) {
                 continue;
+            }
+            const std::string p = it->path().string();
+            const std::string base = it->path().filename().string();
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+                continue; // skip .meta files
             }
             // already indexed by a prior scan? cheap skip so a refresh only opens NEW files.
             if (auto_idx.indexed_files.count(p)) {
@@ -1784,11 +1814,18 @@ private:
             model_fp fp;
             llama_tokens toks;
             if (!slot_meta_read(p, fp, toks)) {
-                continue; // no/short/corrupt meta -> not indexable (invariant 4)
+                SRV_INF("auto cache: skipping %s - no/short/corrupt meta\n", base.c_str());
+                continue;
             }
             if (!(fp == cur_fp)) {
-                continue; // foreign model / requant / different ctx geometry (invariant 3)
+                SRV_INF("auto cache: skipping %s - fingerprint mismatch\n", base.c_str());
+                SRV_INF("  cached:  model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%u\n",
+                        (unsigned long)fp.fp_model, fp.fp_n_ctx_train, fp.fp_n_embd, fp.fp_n_layer, fp.fp_rope_type, fp.fp_n_ctx, fp.fp_kv_full, (unsigned long)fp.fp_block, (unsigned long)fp.fp_rope_scale, (unsigned long)fp.fp_rope_base, fp.fp_yarn_ext, fp.fp_yarn_attn, fp.fp_yarn_beta_fast, fp.fp_yarn_beta_slow, fp.fp_yarn_orig_ctx, (unsigned long)fp.fp_lora, fp.fp_mmproj_loaded);
+                SRV_INF("  current: model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%u\n",
+                        (unsigned long)cur_fp.fp_model, cur_fp.fp_n_ctx_train, cur_fp.fp_n_embd, cur_fp.fp_n_layer, cur_fp.fp_rope_type, cur_fp.fp_n_ctx, cur_fp.fp_kv_full, (unsigned long)cur_fp.fp_block, (unsigned long)cur_fp.fp_rope_scale, (unsigned long)cur_fp.fp_rope_base, cur_fp.fp_yarn_ext, cur_fp.fp_yarn_attn, cur_fp.fp_yarn_beta_fast, cur_fp.fp_yarn_beta_slow, cur_fp.fp_yarn_orig_ctx, (unsigned long)cur_fp.fp_lora, cur_fp.fp_mmproj_loaded);
+                continue;
             }
+            SRV_INF("auto cache: loaded %s (%zu tokens)\n", base.c_str(), toks.size());
             const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
             for (uint64_t bh : bhs) {
