@@ -5238,10 +5238,16 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
+                                        if (slot_was_restored) {
+                                            // After auto-restore, the KV cache already has the data.
+                                            // Don't reset n_past - keep the restored prefix.
+                                            SLT_INF(slot, "[CACHE] no checkpoint found but slot was restored, keeping n_past=%d\n", n_past);
+                                        } else {
+                                            SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                                    "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                            pos_next = 0;
+                                            n_past = 0;
+                                        }
                                     }
                                 }
                             }
