@@ -2042,6 +2042,8 @@ private:
         while (v < lim && disk_toks[v] == req[v]) {
             ++v;
         }
+        SLT_INF(slot, "auto-restore debug: disk_toks.size()=%zu, req.size()=%zu, common_prefix=%zu\n", 
+                disk_toks.size(), req.size(), v);
         // Only WHOLE-block prefixes are valid reuse lengths (hash boundaries).
         const int B = params_base.slot_save_block;
         int n_keep_disk;
@@ -4923,7 +4925,10 @@ private:
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
                                         auto_restore_into_slot(slot, *cand, req, (int) n_past);
-                                        n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        int n_past_after = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        SLT_INF(slot, "auto-restore debug: n_past after restore=%d, slot.prompt.tokens.size()=%zu, input_tokens.size()=%zu\n",
+                                                n_past_after, slot.prompt.tokens.size(), input_tokens.size());
+                                        n_past = n_past_after;
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================
@@ -5190,6 +5195,7 @@ private:
                                     // which supply the required logits so the >=1-token guarantee still holds
                                     const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
                                     const bool has_new_suffix = (size_t) slot.task->n_tokens() > (size_t) n_past;
+                                    SLT_INF(slot, "[CACHE] checkpoint_check start restored=%d suffix=%d n_past=%d\n", slot_was_restored, has_new_suffix, n_past);
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
@@ -5205,16 +5211,20 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    SLT_INF(slot, "[CACHE] checkpoint_check done found=%d n_past=%d ntok=%d\n", !do_reset, n_past, (int)slot.task->n_tokens());
 
                                     if (!do_reset) {
+                                        SLT_INF(slot, "[CACHE] checkpoint pos_min=%d pos_max=%d ntok=%" PRId64 "\n", it->pos_min, it->pos_max, it->n_tokens);
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
+                                        int n_past_before = n_past;
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        SLT_INF(slot, "[CACHE] n_past %d -> %d\n", n_past_before, n_past);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
