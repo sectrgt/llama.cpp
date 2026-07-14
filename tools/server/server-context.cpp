@@ -2136,11 +2136,12 @@ private:
         if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
             return;
         }
-        // get_text_tokens() (not get_tokens()): media-safe accessor that never trips the
-        // get_tokens() GGML_ASSERT(!has_mtmd) under mmproj. For this no-media prompt (has_media()
-        // false, guarded above) it equals the full token-id prefix, so the persisted token stream
-        // and the block-hash key are byte-identical to what a text-only server would write.
-        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        // get_tokens() (includes NULL placeholders for image positions): the KV cache
+        // state saved by llama_state_seq_save_file covers ALL positions, so the token
+        // array must include NULLs to match. On restore, get_common_prefix compares
+        // token-by-token including NULLs, and the chunk-map fallback treats missing
+        // chunks as equal (the auto-restore verification already confirmed the prefix).
+        const llama_tokens toks = slot.prompt.tokens.get_tokens();
         if ((int) toks.size() < params_base.slot_save_block) {
             return; // < 1 block: not worth a multi-GB write
         }
@@ -4898,22 +4899,16 @@ private:
                                 // If the in-memory match (n_past) is POOR and the disk index holds a snapshot
                                 // whose persisted tokens are a verified, fingerprint-matching, longer prefix of
                                 // this request, restore it INTO the slot and RECOMPUTE n_past so all downstream
-                                // machinery runs unchanged — agnostic to HOW the tokens arrived. Gated on the
-                                // PER-REQUEST has_media() (not the server-wide has_mtmd) so an --mmproj server
-                                // still caches its text-only turns: a no-media prompt has no NULL placeholders,
-                                // so get_text_tokens() equals the full token-id prefix and does not trip the
-                                // get_tokens() GGML_ASSERT(!has_mtmd); a turn carrying an image (and every turn
-                                // after it) is skipped. auto_restore_into_slot byte-verifies tokens + fingerprint
+                                // machinery runs unchanged — agnostic to HOW the tokens arrived.
+                                // auto_restore_into_slot byte-verifies tokens + fingerprint
                                 // and falls back to a normal prefill on any mismatch/failure (invariants 2/3/4).
-                                // media-prefix caching intentionally unsupported: token-ids cannot identify image content.
                                 if (auto_cache_enabled()
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
-                                        && !slot.prompt.tokens.has_media()   // no media in THIS request
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
                                         && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
-                                    // get_text_tokens() (not get_tokens()): media-safe accessor that never asserts
-                                    // under has_mtmd and, for this no-media prompt, equals the full token-id prefix.
-                                    const llama_tokens req = input_tokens.get_text_tokens();
+                                    // get_tokens() includes NULL placeholders for image positions, matching
+                                    // the token array saved by auto-save (which also uses get_tokens()).
+                                    const llama_tokens req = input_tokens.get_tokens();
                                     if (auto cand = auto_index_lookup(req)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL

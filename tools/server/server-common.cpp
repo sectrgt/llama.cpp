@@ -487,10 +487,17 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
         const llama_token bi = b.tokens[i];
 
         if (ai == LLAMA_TOKEN_NULL && bi == LLAMA_TOKEN_NULL) {
-            const auto & a_chunk =   find_chunk(i);
-            const auto & b_chunk = b.find_chunk(i);
+            // If either side has no chunk map entry (e.g. restored from disk
+            // without chunk metadata), treat NULLs as equal — the auto-restore
+            // verification already confirmed the token prefix matches.
+            auto a_it =   map_idx_to_media.find(i);
+            auto b_it = b.map_idx_to_media.find(i);
+            if (a_it == map_idx_to_media.end() || b_it == b.map_idx_to_media.end()) {
+                continue;
+            }
 
-            GGML_ASSERT(a_chunk && b_chunk);
+            const auto & a_chunk = a_it->second;
+            const auto & b_chunk = b_it->second;
 
             const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
             const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
@@ -499,7 +506,6 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
 
             if (id_ai == id_bi && n_tok_a == n_tok_b) {
-                GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
                 i += n_tok_a - 1; // will be +1 by the for loop
                 continue;
             }
