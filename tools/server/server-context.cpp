@@ -2030,12 +2030,9 @@ private:
         }
         // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
         // `slot.task` is null here — the just-finished task survives as `slot.task_prev`. Use it for
-        // the generative check (COMPLETION/INFILL only). Gate on the PER-REQUEST `has_media()` (not
-        // the server-wide has_mtmd/mctx) so an --mmproj server still persists its text-only turns;
-        // a turn carrying an image (has_media()==true) is skipped — exactly correct, since token-ids
-        // alone cannot identify image content.
+        // the generative check (COMPLETION/INFILL only).
         const auto & wtask = slot.task ? slot.task : slot.task_prev;
-        if (!wtask || !wtask->need_sampling() || slot.prompt.tokens.has_media()) {
+        if (!wtask || !wtask->need_sampling()) {
             return;
         }
         // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
@@ -3584,12 +3581,9 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // if multimodal is enabled, send an error and return false
+    // multimodal save/restore is now supported
     bool check_no_mtmd(const int id_task) {
-        if (mctx) {
-            send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
+        (void)id_task; // suppress unused param warning
         return true;
     }
 
