@@ -1552,6 +1552,10 @@ public:
 
     ~server_context_impl() {
         if (!sleeping) {
+            // Save all slots to disk before exit (for auto-save to persist across restarts)
+            for (auto & slot : slots) {
+                auto_save_slot_if_useful(slot);
+            }
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
             destroy();
@@ -2025,16 +2029,25 @@ private:
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
     // is the gate; invariant 5: only called on slot release/reassign, never during generation.
     void auto_save_slot_if_useful(server_slot & slot) {
+        SLT_INF(slot, "%s", "auto_save_slot_if_useful called");
         if (!auto_cache_enabled()) {
+            SLT_INF(slot, "%s", "auto_save_slot_if_useful: auto_cache not enabled");
             return; // off by default
         }
+        SLT_INF(slot, "%s", "auto_save_slot_if_useful: auto_cache enabled");
         // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
         // `slot.task` is null here — the just-finished task survives as `slot.task_prev`. Use it for
         // the generative check (COMPLETION/INFILL only).
         const auto & wtask = slot.task ? slot.task : slot.task_prev;
-        if (!wtask || !wtask->need_sampling()) {
+        if (!wtask) {
+            SLT_INF(slot, "%s", "auto_save_slot_if_useful: no wtask");
             return;
         }
+        if (!wtask->need_sampling()) {
+            SLT_INF(slot, "%s", "auto_save_slot_if_useful: task doesn't need sampling");
+            return;
+        }
+        SLT_INF(slot, "%s", "auto_save_slot_if_useful: task needs sampling");
         // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
         // per-request adapter override that differs from it (invariant 3). (Conservative: a future version
         // could fold the slot's adapters into the snapshot fingerprint instead.)
@@ -4149,6 +4162,14 @@ private:
                         } else {
                             SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%zu); sidecar omitted\n",
                                     slot->logits_last_n_tokens, token_count);
+                        }
+                        // Also write the meta file for manual saves, so they can be auto-restored
+                        const auto bhs = auto_block_hashes(tokens, params_base.slot_save_block, cur_fp.fp_model);
+                        if (!bhs.empty()) {
+                            const uint64_t full_hash = bhs.back();
+                            if (!slot_meta_write(filepath, cur_fp, tokens, full_hash)) {
+                                SLT_WRN(*slot, "%s", "failed to write meta sidecar for manual save\n");
+                            }
                         }
                     }
 
