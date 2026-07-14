@@ -993,7 +993,11 @@ json oaicompat_chat_params_parse(
             std::string type = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    // Text-only model: skip image gracefully with warning
+                    LOG_WRN("%s: skipping image for text-only model\n", __func__);
+                    p["type"] = "text";
+                    p["text"] = "[image omitted]";
+                    continue;
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
@@ -1006,7 +1010,11 @@ json oaicompat_chat_params_parse(
 
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
-                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    // Text-only model: skip audio gracefully with warning
+                    LOG_WRN("%s: skipping audio for text-only model\n", __func__);
+                    p["type"] = "text";
+                    p["text"] = "[audio omitted]";
+                    continue;
                 }
 
                 // note: don't need to validate "format", it's redundant
