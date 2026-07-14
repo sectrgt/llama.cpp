@@ -689,6 +689,7 @@ struct common_params {
     // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+    bool    slot_save_compact = true; // delete old prefix caches when saving extended prompts
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

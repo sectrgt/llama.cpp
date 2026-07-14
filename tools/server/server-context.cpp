@@ -1835,6 +1835,47 @@ private:
         }
     }
 
+    // Compact caches after saving a new snapshot: delete shorter exact-prefix caches.
+    // Called AFTER the new cache is safely on disk to avoid data loss on interruption.
+    void auto_index_compact_after_save_locked(const std::string & new_path, const llama_tokens & toks,
+                                               const std::vector<uint64_t> & bhs) {
+        if (!params_base.slot_save_compact || bhs.empty()) return;
+        std::vector<std::pair<std::string, llama_tokens>> all_caches;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec) || ec) continue;
+            const std::string p = it->path().string();
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) continue;
+            if (p == new_path) continue; // skip the newly saved file
+            model_fp fp;
+            llama_tokens meta_toks;
+            if (!slot_meta_read(p, fp, meta_toks)) continue;
+            if (!(fp == cur_fp)) continue;
+            all_caches.push_back({p, std::move(meta_toks)});
+        }
+        std::unordered_set<std::string> to_delete;
+        for (const auto & [path, meta_toks] : all_caches) {
+            if (meta_toks.size() >= toks.size()) continue;
+            const auto short_bhs = auto_block_hashes(meta_toks, params_base.slot_save_block, cur_fp.fp_model);
+            bool is_prefix = true;
+            for (size_t i = 0; i < short_bhs.size(); i++) {
+                if (i >= bhs.size() || short_bhs[i] != bhs[i]) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if (is_prefix) to_delete.insert(path);
+        }
+        for (const auto & path : to_delete) {
+            SRV_INF("auto cache: compacting %s\n", path.c_str());
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(slot_meta_sidecar_path(path), ec);
+            std::filesystem::remove(slot_logits_sidecar_path(path), ec);
+        }
+    }
+
     // One-time startup scan: builds the initial index. Invariant 1: only ever called from an
     // auto_cache_enabled() branch.
     void auto_index_scan() {
@@ -2113,6 +2154,7 @@ private:
         }
 
         const std::string fname = auto_state_filename(full_hash, toks.size());
+
         // cross-process atomicity: the temp path MUST be unique per writer. The final
         // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
         // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
@@ -2177,6 +2219,12 @@ private:
         }
 
         SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
+
+        // Compact old prefix caches AFTER new cache is safely on disk (avoids data loss on interruption).
+        if (params_base.slot_save_compact) {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_compact_after_save_locked(fname, toks, bhs);
+        }
 
         // index insert (every boundary -> this snapshot), then bounded-LRU + reconcile.
         {
