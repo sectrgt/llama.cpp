@@ -4927,8 +4927,8 @@ private:
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
                                         auto_restore_into_slot(slot, *cand, req, (int) n_past);
-                                        SLT_INF(slot, "auto-restore debug: after restore slot.prompt.tokens.size()=%zu, input_tokens.size()=%zu\n",
-                                                slot.prompt.tokens.size(), input_tokens.size());
+                                        SLT_INF(slot, "auto-restore debug: after restore slot.prompt.tokens.size()=%zu has_mtmd=%d, input_tokens.size()=%zu has_mtmd=%d\n",
+                                                slot.prompt.tokens.size(), slot.prompt.tokens.has_mtmd, input_tokens.size(), input_tokens.has_mtmd);
                                         // Compare first few tokens to see where they differ
                                         size_t cmp_limit = std::min(slot.prompt.tokens.size(), input_tokens.size());
                                         size_t first_diff = cmp_limit;
