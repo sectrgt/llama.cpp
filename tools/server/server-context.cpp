@@ -389,6 +389,16 @@ static void slot_save_enforce_limits(const std::string & dir,
                 std::filesystem::remove(p, fec);
                 continue;
             }
+            if (p.size() >= 8 && p.compare(p.size() - 8, 8, ".stokens") == 0 &&
+                !present.count(p.substr(0, p.size() - 8))) {
+                std::filesystem::remove(p, fec);
+                continue;
+            }
+            // a "<X>.stokens" file is a sidecar; accounted with its state file below.
+            if (p.size() >= 8 && p.compare(p.size() - 8, 8, ".stokens") == 0 &&
+                present.count(p.substr(0, p.size() - 8))) {
+                continue;
+            }
 
             slot_save_unit u;
             u.state_path = p;
@@ -410,6 +420,13 @@ static void slot_save_enforce_limits(const std::string & dir,
                 if (!fec) {
                     u.meta_path = meta;
                     u.bytes += mb;
+                }
+            }
+            const std::string stokens = p + ".stokens";
+            if (present.count(stokens)) {
+                const auto sb = std::filesystem::file_size(stokens, fec);
+                if (!fec) {
+                    u.bytes += sb;
                 }
             }
             u.mtime = std::filesystem::last_write_time(p, fec);
@@ -457,8 +474,13 @@ static void slot_save_enforce_limits(const std::string & dir,
     size_t idx = 0;
 
     auto evict_oldest = [&]() -> bool {
-        while (idx < units.size() && units[idx].state_path == just_written) {
-            idx++; // never evict the snapshot we just wrote
+        while (idx < units.size()) {
+            const auto & u = units[idx];
+            const std::string fname = std::filesystem::path(u.state_path).filename().string();
+            // never evict the snapshot we just wrote, and never evict manually saved files
+            if (u.state_path == just_written) { idx++; continue; }
+            if (fname.rfind("auto-", 0) != 0) { idx++; continue; }
+            break;
         }
         if (idx >= units.size()) {
             return false;
@@ -1763,9 +1785,10 @@ private:
             auto_idx.dir_mtime = dmt; // snapshot the dir mtime we are scanning at
         }
         std::error_code ec;
-        // First pass: collect all auto-*.bin files and check for orphans
+        // First pass: collect all *.bin files and check for orphans
         std::unordered_set<std::string> bin_files;
         std::unordered_set<std::string> meta_files;
+        std::unordered_set<std::string> stokens_files;
         for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
              !ec && it != end; it.increment(ec)) {
             std::error_code fec;
@@ -1774,12 +1797,12 @@ private:
             }
             const std::string p = it->path().string();
             const std::string base = it->path().filename().string();
-            if (base.rfind("auto-", 0) != 0) {
-                continue; // not one of ours
-            }
             if (p.size() >= 9 && p.compare(p.size() - 9, 9, ".bin.meta") == 0) {
                 // Extract base name without .bin.meta
                 meta_files.insert(base.substr(0, base.size() - 9));
+            } else if (p.size() >= 12 && p.compare(p.size() - 12, 12, ".bin.stokens") == 0) {
+                // Extract base name without .bin.stokens
+                stokens_files.insert(base.substr(0, base.size() - 12));
             } else if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".bin") == 0) {
                 // Extract base name without .bin
                 bin_files.insert(base.substr(0, base.size() - 4));
@@ -1788,12 +1811,17 @@ private:
         // Check for orphans
         for (const auto & b : bin_files) {
             if (meta_files.find(b) == meta_files.end()) {
-                SRV_WRN("auto cache: orphan bin file (no .meta): auto-%s.bin\n", b.c_str());
+                SRV_WRN("auto cache: orphan bin file (no .meta): %s.bin\n", b.c_str());
             }
         }
         for (const auto & b : meta_files) {
             if (bin_files.find(b) == bin_files.end()) {
-                SRV_WRN("auto cache: orphan meta file (no .bin): auto-%s.bin.meta\n", b.c_str());
+                SRV_WRN("auto cache: orphan meta file (no .bin): %s.bin.meta\n", b.c_str());
+            }
+        }
+        for (const auto & b : stokens_files) {
+            if (bin_files.find(b) == bin_files.end()) {
+                SRV_WRN("auto cache: orphan stokens file (no .bin): %s.bin.stokens\n", b.c_str());
             }
         }
         // Second pass: index bin files with valid .meta
@@ -1850,6 +1878,9 @@ private:
             const std::string p = it->path().string();
             if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) continue;
             if (p == new_path) continue; // skip the newly saved file
+            // skip manually saved files (only compact auto-saved caches)
+            const std::string pbase = it->path().filename().string();
+            if (pbase.rfind("auto-", 0) != 0) continue;
             model_fp fp;
             llama_tokens meta_toks;
             if (!slot_meta_read(p, fp, meta_toks)) continue;
@@ -4321,7 +4352,9 @@ private:
                             SLT_DBG(*slot, "no matching captured logits for this state (stamp=%d, token_count=%zu); sidecar omitted\n",
                                     slot->logits_last_n_tokens, token_count);
                         }
-                        // Also write the meta file for manual saves, so they can be auto-restored
+                    }
+                    // write the meta file for manual saves, so they can be auto-restored
+                    if (nwrite > 0) {
                         const auto bhs = auto_block_hashes(tokens, params_base.slot_save_block, cur_fp.fp_model);
                         if (!bhs.empty()) {
                             const uint64_t full_hash = bhs.back();
