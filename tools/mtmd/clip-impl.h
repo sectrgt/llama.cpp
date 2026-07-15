@@ -617,16 +617,8 @@ struct clip_image_f32 {
     size_t deserialize(const uint8_t * data, size_t size) {
         const uint8_t * ptr = data;
         const uint8_t * end = data + size;
-        auto read_u32 = [&]() -> bool {
-            if (ptr + 4 > end) return false;
-            uint32_t v;
-            memcpy(&v, ptr, 4);
-            ptr += 4;
-            add_viewsep = v ? true : false;
-            return true;
-        };
-        if (ptr + 4 > end) return 0;
         uint32_t v;
+        if (ptr + 4 > end) return 0;
         memcpy(&v, ptr, 4); ptr += 4; add_viewsep = v ? true : false;
         if (ptr + 4 > end) return 0;
         memcpy(&v, ptr, 4); ptr += 4; add_newline = v ? true : false;
