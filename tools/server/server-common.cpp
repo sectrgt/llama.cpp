@@ -565,7 +565,8 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
-// serialize server_tokens (including mtmd chunk data) for slot save/restore
+// serialize mtmd chunk data for slot save/restore
+// only saves map_idx_to_media (chunk data); tokens are saved separately in .bin and .meta
 std::vector<uint8_t> server_tokens::serialize() const {
     std::vector<uint8_t> out;
     auto write_u32 = [&](uint32_t v) {
@@ -580,16 +581,10 @@ std::vector<uint8_t> server_tokens::serialize() const {
 
     // magic + version
     write_u32(0x53544F4B); // "STOK"
-    write_u32(1); // version 1
+    write_u32(2); // version 2 (no token array; only chunk data)
 
     // has_mtmd flag
     write_u32(has_mtmd ? 1 : 0);
-
-    // tokens (including LLAMA_TOKEN_NULL placeholders)
-    write_u64((uint64_t) tokens.size());
-    if (!tokens.empty()) {
-        write_bytes(tokens.data(), tokens.size() * sizeof(llama_token));
-    }
 
     // chunks
     write_u64((uint64_t) map_idx_to_media.size());
@@ -606,8 +601,9 @@ std::vector<uint8_t> server_tokens::serialize() const {
     return out;
 }
 
-// deserialize server_tokens (including mtmd chunk data) for slot save/restore
+// deserialize mtmd chunk data for slot save/restore
 // populates map_idx_to_media with real mtmd_input_chunk objects
+// does NOT touch tokens (caller sets them from .bin)
 bool server_tokens::deserialize(const uint8_t * data, size_t size) {
     const uint8_t * ptr = data;
     const uint8_t * end = data + size;
@@ -625,21 +621,11 @@ bool server_tokens::deserialize(const uint8_t * data, size_t size) {
     uint32_t magic = read_u32();
     if (magic != 0x53544F4B) return false;
     uint32_t version = read_u32();
-    if (version != 1) return false;
+    if (version != 2) return false;
 
     // has_mtmd flag
     uint32_t has_mtmd_flag = read_u32();
     has_mtmd = has_mtmd_flag ? true : false;
-
-    // tokens (including LLAMA_TOKEN_NULL placeholders - kept as-is)
-    uint64_t n_tokens = read_u64();
-    tokens.clear();
-    tokens.resize(n_tokens);
-    if (n_tokens > 0) {
-        if (ptr + n_tokens * sizeof(llama_token) > end) return false;
-        memcpy(tokens.data(), ptr, n_tokens * sizeof(llama_token));
-        ptr += n_tokens * sizeof(llama_token);
-    }
 
     // chunks - populate map_idx_to_media with real mtmd_input_chunk objects
     uint64_t n_chunks = read_u64();

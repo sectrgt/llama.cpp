@@ -2024,33 +2024,32 @@ private:
         tokens.resize(token_count);
         SLT_INF(slot, "do_slot_restore: loaded %zu tokens from .bin\n", token_count);
 
-        // Try to load .stokens sidecar (includes mtmd chunk data for multimodal restore)
-        std::string stokens_path = filepath + ".stokens";
-        bool stokens_loaded = false;
-        FILE * fp_stokens = fopen(stokens_path.c_str(), "rb");
-        if (fp_stokens) {
-            fseek(fp_stokens, 0, SEEK_END);
-            long stokens_size = ftell(fp_stokens);
-            fseek(fp_stokens, 0, SEEK_SET);
-            if (stokens_size > 0) {
-                std::vector<uint8_t> stokens_data(stokens_size);
-                size_t nread_stokens = fread(stokens_data.data(), 1, stokens_size, fp_stokens);
-                fclose(fp_stokens);
-                if (nread_stokens == (size_t) stokens_size && slot.prompt.tokens.deserialize(stokens_data.data(), stokens_data.size())) {
-                    stokens_loaded = true;
-                    SLT_INF(slot, "do_slot_restore: loaded .stokens sidecar (%ld bytes, has_media=%d)\n",
-                            stokens_size, slot.prompt.tokens.has_media());
-                } else {
-                    SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar, falling back to .bin tokens");
-                }
-            } else {
-                fclose(fp_stokens);
-            }
-        }
+        // tokens always come from .bin; chunk data (map_idx_to_media) comes from .stokens
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(tokens);
 
-        if (!stokens_loaded) {
-            slot.prompt.tokens.clear();
-            slot.prompt.tokens.insert(tokens);
+        // load .stokens sidecar (chunk data only; tokens already loaded from .bin)
+        {
+            std::string stokens_path = filepath + ".stokens";
+            FILE * fp_stokens = fopen(stokens_path.c_str(), "rb");
+            if (fp_stokens) {
+                fseek(fp_stokens, 0, SEEK_END);
+                long stokens_size = ftell(fp_stokens);
+                fseek(fp_stokens, 0, SEEK_SET);
+                if (stokens_size > 0) {
+                    std::vector<uint8_t> stokens_data(stokens_size);
+                    size_t nread_stokens = fread(stokens_data.data(), 1, stokens_size, fp_stokens);
+                    fclose(fp_stokens);
+                    if (nread_stokens == (size_t) stokens_size && slot.prompt.tokens.deserialize(stokens_data.data(), stokens_data.size())) {
+                        SLT_INF(slot, "do_slot_restore: loaded .stokens sidecar (%ld bytes, has_media=%d)\n",
+                                stokens_size, slot.prompt.tokens.has_media());
+                    } else {
+                        SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar");
+                    }
+                } else {
+                    fclose(fp_stokens);
+                }
+            }
         }
         SLT_INF(slot, "do_slot_restore: slot.prompt.tokens.size() = %zu\n", slot.prompt.tokens.size());
         slot.just_restored = true;
