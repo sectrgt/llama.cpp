@@ -136,6 +136,52 @@ struct mtmd_image_tokens {
             id
         };
     }
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        auto write_u32 = [&](uint32_t v) {
+            size_t s = out.size();
+            out.resize(s + 4);
+            memcpy(out.data() + s, &v, 4);
+        };
+        auto write_u64 = [&](uint64_t v) {
+            size_t s = out.size();
+            out.resize(s + 8);
+            memcpy(out.data() + s, &v, 8);
+        };
+        auto write_str = [&](const std::string & s) {
+            write_u64((uint64_t) s.size());
+            out.insert(out.end(), s.begin(), s.end());
+        };
+        write_u32(nx);
+        write_u32(ny);
+        write_u32((uint32_t) pos);
+        write_u32(image_idx);
+        write_u32(n_temporal_merge);
+        write_str(id);
+        auto batch_data = batch_f32.serialize();
+        write_u64((uint64_t) batch_data.size());
+        out.insert(out.end(), batch_data.begin(), batch_data.end());
+        return out;
+    }
+
+    size_t deserialize(const uint8_t * data, size_t size) {
+        const uint8_t * ptr = data;
+        const uint8_t * end = data + size;
+        if (ptr + 4 > end) return 0; memcpy(&nx,             ptr, 4); ptr += 4;
+        if (ptr + 4 > end) return 0; memcpy(&ny,             ptr, 4); ptr += 4;
+        if (ptr + 4 > end) return 0; memcpy(&pos,            ptr, 4); ptr += 4;
+        if (ptr + 4 > end) return 0; memcpy(&image_idx,      ptr, 4); ptr += 4;
+        if (ptr + 4 > end) return 0; memcpy(&n_temporal_merge, ptr, 4); ptr += 4;
+        if (ptr + 8 > end) return 0; uint64_t id_len; memcpy(&id_len, ptr, 8); ptr += 8;
+        if (ptr + id_len > end) return 0; id.assign((const char *) ptr, id_len); ptr += id_len;
+        if (ptr + 8 > end) return 0; uint64_t batch_size; memcpy(&batch_size, ptr, 8); ptr += 8;
+        if (ptr + batch_size > end) return 0;
+        size_t consumed = batch_f32.deserialize(ptr, batch_size);
+        if (consumed == 0) return 0;
+        ptr += consumed;
+        return (size_t)(ptr - data);
+    }
 };
 using mtmd_image_tokens_ptr = std::unique_ptr<mtmd_image_tokens>;
 
@@ -160,6 +206,40 @@ struct mtmd_audio_tokens {
             batch_f32.clone(),
             id
         };
+    }
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        auto write_u32 = [&](uint32_t v) {
+            size_t s = out.size(); out.resize(s + 4); memcpy(out.data() + s, &v, 4);
+        };
+        auto write_u64 = [&](uint64_t v) {
+            size_t s = out.size(); out.resize(s + 8); memcpy(out.data() + s, &v, 8);
+        };
+        auto write_str = [&](const std::string & s) {
+            write_u64((uint64_t) s.size());
+            out.insert(out.end(), s.begin(), s.end());
+        };
+        write_u32(n_tokens);
+        write_str(id);
+        auto batch_data = batch_f32.serialize();
+        write_u64((uint64_t) batch_data.size());
+        out.insert(out.end(), batch_data.begin(), batch_data.end());
+        return out;
+    }
+
+    size_t deserialize(const uint8_t * data, size_t size) {
+        const uint8_t * ptr = data;
+        const uint8_t * end = data + size;
+        if (ptr + 4 > end) return 0; memcpy(&n_tokens, ptr, 4); ptr += 4;
+        if (ptr + 8 > end) return 0; uint64_t id_len; memcpy(&id_len, ptr, 8); ptr += 8;
+        if (ptr + id_len > end) return 0; id.assign((const char *) ptr, id_len); ptr += id_len;
+        if (ptr + 8 > end) return 0; uint64_t batch_size; memcpy(&batch_size, ptr, 8); ptr += 8;
+        if (ptr + batch_size > end) return 0;
+        size_t consumed = batch_f32.deserialize(ptr, batch_size);
+        if (consumed == 0) return 0;
+        ptr += consumed;
+        return (size_t)(ptr - data);
     }
 };
 using mtmd_audio_tokens_ptr = std::unique_ptr<mtmd_audio_tokens>;
@@ -1875,6 +1955,106 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     if (chunk) {
         delete chunk;
     }
+}
+
+// serialize/deserialize an input chunk (for slot save/restore)
+size_t mtmd_input_chunk_serialize(const mtmd_input_chunk * chunk, uint8_t * out, size_t out_size) {
+    std::vector<uint8_t> buf;
+    auto write_u32 = [&](uint32_t v) {
+        size_t s = buf.size(); buf.resize(s + 4); memcpy(buf.data() + s, &v, 4);
+    };
+    auto write_u64 = [&](uint64_t v) {
+        size_t s = buf.size(); buf.resize(s + 8); memcpy(buf.data() + s, &v, 8);
+    };
+    auto write_bytes = [&](const void * data, size_t len) {
+        buf.insert(buf.end(), (const uint8_t *) data, (const uint8_t *) data + len);
+    };
+
+    // type
+    write_u32((uint32_t) chunk->type);
+
+    // tokens_text
+    write_u64((uint64_t) chunk->tokens_text.size());
+    if (!chunk->tokens_text.empty()) {
+        write_bytes(chunk->tokens_text.data(), chunk->tokens_text.size() * sizeof(llama_token));
+    }
+
+    // image or audio data
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE && chunk->tokens_image) {
+        write_u32(1); // has image
+        auto img_data = chunk->tokens_image->serialize();
+        write_u64((uint64_t) img_data.size());
+        buf.insert(buf.end(), img_data.begin(), img_data.end());
+    } else {
+        write_u32(0); // no image
+    }
+
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO && chunk->tokens_audio) {
+        write_u32(1); // has audio
+        auto aud_data = chunk->tokens_audio->serialize();
+        write_u64((uint64_t) aud_data.size());
+        buf.insert(buf.end(), aud_data.begin(), aud_data.end());
+    } else {
+        write_u32(0); // no audio
+    }
+
+    if (out && buf.size() <= out_size) {
+        memcpy(out, buf.data(), buf.size());
+    }
+    return buf.size();
+}
+
+mtmd_input_chunk * mtmd_input_chunk_deserialize(const uint8_t * data, size_t size) {
+    const uint8_t * ptr = data;
+    const uint8_t * end = data + size;
+
+    auto read_u32 = [&]() -> uint32_t {
+        if (ptr + 4 > end) return 0;
+        uint32_t v; memcpy(&v, ptr, 4); ptr += 4; return v;
+    };
+    auto read_u64 = [&]() -> uint64_t {
+        if (ptr + 8 > end) return 0;
+        uint64_t v; memcpy(&v, ptr, 8); ptr += 8; return v;
+    };
+
+    uint32_t type = read_u32();
+    if (ptr > end) return nullptr;
+
+    auto * chunk = new mtmd_input_chunk();
+    chunk->type = (mtmd_input_chunk_type) type;
+
+    uint64_t n_text = read_u64();
+    if (ptr > end) { delete chunk; return nullptr; }
+    if (n_text > 0) {
+        chunk->tokens_text.resize(n_text);
+        if (ptr + n_text * sizeof(llama_token) > end) { delete chunk; return nullptr; }
+        memcpy(chunk->tokens_text.data(), ptr, n_text * sizeof(llama_token));
+        ptr += n_text * sizeof(llama_token);
+    }
+
+    uint32_t has_image = read_u32();
+    if (ptr > end) { delete chunk; return nullptr; }
+    if (has_image) {
+        uint64_t img_size = read_u64();
+        if (ptr > end || ptr + img_size > end) { delete chunk; return nullptr; }
+        chunk->tokens_image = mtmd_image_tokens_ptr(new mtmd_image_tokens());
+        size_t consumed = chunk->tokens_image->deserialize(ptr, img_size);
+        if (consumed == 0) { delete chunk; return nullptr; }
+        ptr += consumed;
+    }
+
+    uint32_t has_audio = read_u32();
+    if (ptr > end) { delete chunk; return nullptr; }
+    if (has_audio) {
+        uint64_t aud_size = read_u64();
+        if (ptr > end || ptr + aud_size > end) { delete chunk; return nullptr; }
+        chunk->tokens_audio = mtmd_audio_tokens_ptr(new mtmd_audio_tokens());
+        size_t consumed = chunk->tokens_audio->deserialize(ptr, aud_size);
+        if (consumed == 0) { delete chunk; return nullptr; }
+        ptr += consumed;
+    }
+
+    return chunk;
 }
 
 // mtmd_image_tokens

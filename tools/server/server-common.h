@@ -229,6 +229,10 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+
+    // serialize/deserialize for slot save/restore (includes mtmd chunk data)
+    std::vector<uint8_t> serialize() const;
+    bool deserialize(const uint8_t * data, size_t size);
 };
 
 

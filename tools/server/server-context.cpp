@@ -438,6 +438,7 @@ static void slot_save_enforce_limits(const std::string & dir,
                 if (!u.meta_path.empty()) {
                     std::filesystem::remove(u.meta_path, ec);
                 }
+                std::filesystem::remove((u.state_path + ".stokens"), ec);
                 break;
             }
         }
@@ -470,6 +471,7 @@ static void slot_save_enforce_limits(const std::string & dir,
         if (!u.meta_path.empty()) {
             std::filesystem::remove(u.meta_path, ec);
         }
+        std::filesystem::remove((u.state_path + ".stokens"), ec);
         total -= std::min(total, (uintmax_t) u.bytes);
         count = (count > 0) ? count - 1 : 0;
         idx++;
@@ -1873,6 +1875,7 @@ private:
             std::filesystem::remove(path, ec);
             std::filesystem::remove(slot_meta_sidecar_path(path), ec);
             std::filesystem::remove(slot_logits_sidecar_path(path), ec);
+            std::filesystem::remove((path + ".stokens"), ec);
         }
     }
 
@@ -1989,8 +1992,35 @@ private:
         }
         tokens.resize(token_count);
         SLT_INF(slot, "do_slot_restore: loaded %zu tokens from .bin\n", token_count);
-        slot.prompt.tokens.clear();
-        slot.prompt.tokens.insert(tokens);
+
+        // Try to load .stokens sidecar (includes mtmd chunk data for multimodal restore)
+        std::string stokens_path = filepath + ".stokens";
+        bool stokens_loaded = false;
+        FILE * fp_stokens = fopen(stokens_path.c_str(), "rb");
+        if (fp_stokens) {
+            fseek(fp_stokens, 0, SEEK_END);
+            long stokens_size = ftell(fp_stokens);
+            fseek(fp_stokens, 0, SEEK_SET);
+            if (stokens_size > 0) {
+                std::vector<uint8_t> stokens_data(stokens_size);
+                size_t nread_stokens = fread(stokens_data.data(), 1, stokens_size, fp_stokens);
+                fclose(fp_stokens);
+                if (nread_stokens == (size_t) stokens_size && slot.prompt.tokens.deserialize(stokens_data.data(), stokens_data.size())) {
+                    stokens_loaded = true;
+                    SLT_INF(slot, "do_slot_restore: loaded .stokens sidecar (%ld bytes, has_media=%d)\n",
+                            stokens_size, slot.prompt.tokens.has_media());
+                } else {
+                    SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar, falling back to .bin tokens");
+                }
+            } else {
+                fclose(fp_stokens);
+            }
+        }
+
+        if (!stokens_loaded) {
+            slot.prompt.tokens.clear();
+            slot.prompt.tokens.insert(tokens);
+        }
         SLT_INF(slot, "do_slot_restore: slot.prompt.tokens.size() = %zu\n", slot.prompt.tokens.size());
         slot.just_restored = true;
 
@@ -2195,7 +2225,28 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            std::filesystem::remove((tmp + ".stokens"), ec);
             return; // invariant 4
+        }
+        // 3b) stokens sidecar on the temp path (mtmd chunk data for multimodal restore).
+        //     Includes full chunk data (batch_f32) so map_idx_to_media can be fully restored.
+        {
+            auto stokens_data = slot.prompt.tokens.serialize();
+            if (!stokens_data.empty()) {
+                std::string stokens_tmp = tmp + ".stokens";
+                FILE * fp = fopen(stokens_tmp.c_str(), "wb");
+                if (fp) {
+                    fwrite(stokens_data.data(), 1, stokens_data.size(), fp);
+                    fclose(fp);
+                } else {
+                    std::error_code ec;
+                    std::filesystem::remove(tmp, ec);
+                    std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+                    std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+                    std::filesystem::remove(stokens_tmp, ec);
+                    return; // invariant 4
+                }
+            }
         }
         // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
         //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
@@ -2210,6 +2261,8 @@ private:
         std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
         ec.clear();
         std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
+        ec.clear();
+        std::filesystem::rename((tmp + ".stokens"), (fname + ".stokens"), ec);
         // the .meta is the scan key — a unit whose .meta never landed must NOT be
         // published. If the meta rename failed, the .bin is already in place but unindexable, so we
         // unlink the orphan .bin (and any leftover temps) and DO NOT insert into the in-memory index.
@@ -2220,6 +2273,8 @@ private:
             std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            std::filesystem::remove((tmp + ".stokens"), rec);
+            std::filesystem::remove((fname + ".stokens"), rec);
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
 
@@ -4228,6 +4283,19 @@ private:
 
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+
+                    // write .stokens sidecar (mtmd chunk data for multimodal restore)
+                    if (nwrite > 0) {
+                        auto stokens_data = slot->prompt.tokens.serialize();
+                        if (!stokens_data.empty()) {
+                            std::string stokens_path = filepath + ".stokens";
+                            FILE * fp = fopen(stokens_path.c_str(), "wb");
+                            if (fp) {
+                                fwrite(stokens_data.data(), 1, stokens_data.size(), fp);
+                                fclose(fp);
+                            }
+                        }
+                    }
 
                     // persist this slot's last-token logits as a sidecar (FULL/recurrent
                     // only). Best-effort — a missing/failed sidecar simply disables the regenerate

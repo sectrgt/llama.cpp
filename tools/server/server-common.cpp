@@ -565,6 +565,98 @@ server_tokens server_tokens::clone() const {
     return res;
 }
 
+// serialize server_tokens (including mtmd chunk data) for slot save/restore
+std::vector<uint8_t> server_tokens::serialize() const {
+    std::vector<uint8_t> out;
+    auto write_u32 = [&](uint32_t v) {
+        size_t s = out.size(); out.resize(s + 4); memcpy(out.data() + s, &v, 4);
+    };
+    auto write_u64 = [&](uint64_t v) {
+        size_t s = out.size(); out.resize(s + 8); memcpy(out.data() + s, &v, 8);
+    };
+    auto write_bytes = [&](const void * data, size_t len) {
+        out.insert(out.end(), (const uint8_t *) data, (const uint8_t *) data + len);
+    };
+
+    // magic + version
+    write_u32(0x53544F4B); // "STOK"
+    write_u32(1); // version 1
+
+    // has_mtmd flag
+    write_u32(has_mtmd ? 1 : 0);
+
+    // tokens (including LLAMA_TOKEN_NULL placeholders)
+    write_u64((uint64_t) tokens.size());
+    if (!tokens.empty()) {
+        write_bytes(tokens.data(), tokens.size() * sizeof(llama_token));
+    }
+
+    // chunks
+    write_u64((uint64_t) map_idx_to_media.size());
+    for (const auto & [idx, chunk_ptr] : map_idx_to_media) {
+        write_u64((uint64_t) idx);
+        // serialize the chunk via mtmd API
+        size_t chunk_size = mtmd_input_chunk_serialize(chunk_ptr.get(), nullptr, 0);
+        std::vector<uint8_t> chunk_buf(chunk_size);
+        mtmd_input_chunk_serialize(chunk_ptr.get(), chunk_buf.data(), chunk_buf.size());
+        write_u64((uint64_t) chunk_buf.size());
+        write_bytes(chunk_buf.data(), chunk_buf.size());
+    }
+
+    return out;
+}
+
+// deserialize server_tokens (including mtmd chunk data) for slot save/restore
+// populates map_idx_to_media with real mtmd_input_chunk objects
+bool server_tokens::deserialize(const uint8_t * data, size_t size) {
+    const uint8_t * ptr = data;
+    const uint8_t * end = data + size;
+
+    auto read_u32 = [&]() -> uint32_t {
+        if (ptr + 4 > end) return 0;
+        uint32_t v; memcpy(&v, ptr, 4); ptr += 4; return v;
+    };
+    auto read_u64 = [&]() -> uint64_t {
+        if (ptr + 8 > end) return 0;
+        uint64_t v; memcpy(&v, ptr, 8); ptr += 8; return v;
+    };
+
+    // magic + version
+    uint32_t magic = read_u32();
+    if (magic != 0x53544F4B) return false;
+    uint32_t version = read_u32();
+    if (version != 1) return false;
+
+    // has_mtmd flag
+    uint32_t has_mtmd_flag = read_u32();
+    has_mtmd = has_mtmd_flag ? true : false;
+
+    // tokens (including LLAMA_TOKEN_NULL placeholders - kept as-is)
+    uint64_t n_tokens = read_u64();
+    tokens.clear();
+    tokens.resize(n_tokens);
+    if (n_tokens > 0) {
+        if (ptr + n_tokens * sizeof(llama_token) > end) return false;
+        memcpy(tokens.data(), ptr, n_tokens * sizeof(llama_token));
+        ptr += n_tokens * sizeof(llama_token);
+    }
+
+    // chunks - populate map_idx_to_media with real mtmd_input_chunk objects
+    uint64_t n_chunks = read_u64();
+    map_idx_to_media.clear();
+    for (uint64_t i = 0; i < n_chunks; i++) {
+        uint64_t idx = read_u64();
+        uint64_t chunk_size = read_u64();
+        if (ptr + chunk_size > end) return false;
+        mtmd_input_chunk * chunk = mtmd_input_chunk_deserialize(ptr, chunk_size);
+        if (!chunk) return false;
+        ptr += chunk_size;
+        map_idx_to_media[(size_t) idx] = mtmd::input_chunk_ptr(chunk);
+    }
+
+    return true;
+}
+
 //
 // tokenizer and input processing utils
 //

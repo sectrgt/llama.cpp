@@ -232,6 +232,12 @@ MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk);
 MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 
+// serialize/deserialize an input chunk (for slot save/restore)
+// serialize returns the size of the buffer needed; if out is non-null, writes to out (up to out_size)
+// deserialize returns a new chunk (caller must free with mtmd_input_chunk_free), or nullptr on error
+MTMD_API size_t             mtmd_input_chunk_serialize(const mtmd_input_chunk * chunk, uint8_t * out, size_t out_size);
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_deserialize(const uint8_t * data, size_t size);
+
 
 // mtmd_image_tokens
 //

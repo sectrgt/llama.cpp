@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdarg>
 #include <cinttypes>
+#include <cstring>
 #include <string>
 #include <map>
 #include <sstream>
@@ -582,6 +583,69 @@ struct clip_image_f32 {
         return buf.empty();
     }
 
+    // serialize to a byte buffer (for slot save/restore)
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        auto write_u32 = [&](uint32_t v) {
+            size_t s = out.size();
+            out.resize(s + 4);
+            memcpy(out.data() + s, &v, 4);
+        };
+        auto write_u64 = [&](uint64_t v) {
+            size_t s = out.size();
+            out.resize(s + 8);
+            memcpy(out.data() + s, &v, 8);
+        };
+        auto write_f32 = [&](float v) {
+            size_t s = out.size();
+            out.resize(s + sizeof(float));
+            memcpy(out.data() + s, &v, sizeof(float));
+        };
+        write_u32(add_viewsep ? 1 : 0);
+        write_u32(add_newline ? 1 : 0);
+        write_u32((uint32_t) nx_);
+        write_u32((uint32_t) ny_);
+        write_u64((uint64_t) buf.size());
+        for (float v : buf) {
+            write_f32(v);
+        }
+        return out;
+    }
+
+    // deserialize from a byte buffer (for slot save/restore)
+    // returns number of bytes consumed, or 0 on error
+    size_t deserialize(const uint8_t * data, size_t size) {
+        const uint8_t * ptr = data;
+        const uint8_t * end = data + size;
+        auto read_u32 = [&]() -> bool {
+            if (ptr + 4 > end) return false;
+            uint32_t v;
+            memcpy(&v, ptr, 4);
+            ptr += 4;
+            add_viewsep = v ? true : false;
+            return true;
+        };
+        if (ptr + 4 > end) return 0;
+        uint32_t v;
+        memcpy(&v, ptr, 4); ptr += 4; add_viewsep = v ? true : false;
+        if (ptr + 4 > end) return 0;
+        memcpy(&v, ptr, 4); ptr += 4; add_newline = v ? true : false;
+        if (ptr + 4 > end) return 0;
+        memcpy(&v, ptr, 4); ptr += 4; nx_ = (int) v;
+        if (ptr + 4 > end) return 0;
+        memcpy(&v, ptr, 4); ptr += 4; ny_ = (int) v;
+        if (ptr + 8 > end) return 0;
+        uint64_t buf_size;
+        memcpy(&buf_size, ptr, 8); ptr += 8;
+        if (ptr + buf_size * sizeof(float) > end) return 0;
+        buf.resize(buf_size);
+        if (buf_size > 0) {
+            memcpy(buf.data(), ptr, buf_size * sizeof(float));
+            ptr += buf_size * sizeof(float);
+        }
+        return (size_t)(ptr - data);
+    }
+
   private:
     std::vector<float> buf;
     int nx_ = 0;
@@ -651,6 +715,53 @@ static void clip_log_internal(enum ggml_log_level level, const char * format, ..
 struct clip_image_f32_batch {
     std::vector<clip_image_f32> entries;
     bool is_audio = false;
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        auto write_u32 = [&](uint32_t v) {
+            size_t s = out.size();
+            out.resize(s + 4);
+            memcpy(out.data() + s, &v, 4);
+        };
+        auto write_u64 = [&](uint64_t v) {
+            size_t s = out.size();
+            out.resize(s + 8);
+            memcpy(out.data() + s, &v, 8);
+        };
+        write_u32(is_audio ? 1 : 0);
+        write_u64((uint64_t) entries.size());
+        for (const auto & entry : entries) {
+            auto entry_data = entry.serialize();
+            write_u64((uint64_t) entry_data.size());
+            out.insert(out.end(), entry_data.begin(), entry_data.end());
+        }
+        return out;
+    }
+
+    size_t deserialize(const uint8_t * data, size_t size) {
+        const uint8_t * ptr = data;
+        const uint8_t * end = data + size;
+        if (ptr + 4 > end) return 0;
+        uint32_t v;
+        memcpy(&v, ptr, 4); ptr += 4; is_audio = v ? true : false;
+        if (ptr + 8 > end) return 0;
+        uint64_t n_entries;
+        memcpy(&n_entries, ptr, 8); ptr += 8;
+        entries.clear();
+        entries.reserve(n_entries);
+        for (uint64_t i = 0; i < n_entries; i++) {
+            if (ptr + 8 > end) return 0;
+            uint64_t entry_size;
+            memcpy(&entry_size, ptr, 8); ptr += 8;
+            if (ptr + entry_size > end) return 0;
+            clip_image_f32 entry;
+            size_t consumed = entry.deserialize(ptr, entry_size);
+            if (consumed == 0) return 0;
+            ptr += consumed;
+            entries.push_back(std::move(entry));
+        }
+        return (size_t)(ptr - data);
+    }
 
     clip_image_f32_batch clone() const {
         clip_image_f32_batch new_batch{
