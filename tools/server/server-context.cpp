@@ -2044,11 +2044,32 @@ private:
                         SLT_INF(slot, "do_slot_restore: loaded .stokens sidecar (%ld bytes, has_media=%d)\n",
                                 stokens_size, slot.prompt.tokens.has_media());
                     } else {
-                        SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar");
+                        SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar, clearing KV cache");
+                        // .stokens failed to load (e.g. version mismatch) but tokens have NULLs
+                        // (multimodal): pos_next() would return wrong values without map_idx_to_media,
+                        // causing a crash in common_context_seq_rm. Clear KV cache and fall back to prefill.
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                        slot.prompt.tokens.clear();
+                        return false;
                     }
                 } else {
                     fclose(fp_stokens);
                 }
+            }
+        }
+        // safety check: if tokens have NULLs (multimodal) but map_idx_to_media is empty
+        // (no .stokens or failed load), pos_next() would return wrong values, causing a crash.
+        // Clear KV cache and fall back to prefill.
+        if (slot.prompt.tokens.has_mtmd && !slot.prompt.tokens.has_media()) {
+            bool has_null = false;
+            for (llama_token t : slot.prompt.tokens.get_tokens()) {
+                if (t == LLAMA_TOKEN_NULL) { has_null = true; break; }
+            }
+            if (has_null) {
+                SLT_WRN(slot, "%s", "do_slot_restore: tokens have NULLs but no chunk data, clearing KV cache\n");
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                slot.prompt.tokens.clear();
+                return false;
             }
         }
         SLT_INF(slot, "do_slot_restore: slot.prompt.tokens.size() = %zu\n", slot.prompt.tokens.size());
