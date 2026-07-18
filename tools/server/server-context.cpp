@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -543,7 +544,7 @@ static void slot_save_enforce_limits(const std::string & dir,
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t SLOT_META_MAGIC   = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
-static constexpr uint32_t SLOT_META_VERSION = 1u;
+static constexpr uint32_t SLOT_META_VERSION = 2u; // v2: fp_mmproj_hash u64 (was u32 fp_mmproj_loaded) + media chunk hashes
 
 // Model/quant/context fingerprint that MUST match for a restore to be sound. All
 // fields are stable inference-affecting identity captured once at model load and
@@ -577,17 +578,18 @@ struct model_fp {
     uint32_t fp_yarn_beta_slow  = 0; // bit-pattern of yarn_beta_slow
     uint32_t fp_yarn_orig_ctx   = 0; // yarn_orig_ctx (int)
     uint64_t fp_lora       = 0; // hash of active LoRA-set ids+scales (0 if none)
-    // refuse cross-shape restores: 1 if the server was launched with --mmproj (mctx != nullptr),
-    // else 0. The auto-cache only ever persists text-only prefixes, but mmproj-aware rope (M-RoPE)
-    // and projector wiring CAN alter the text KV layout, so we conservatively REFUSE to cross-load
-    // a text-only-server snapshot into an mmproj server (or vice-versa) — they get disjoint stores.
-    // Removing this bit later would require proving the text KV layout is identical across the two
-    // deployment shapes.
-    uint32_t fp_mmproj_loaded   = 0;
+    // refuse cross-shape restores: hash of the mmproj file path (0 if no mmproj).
+    // The auto-cache only ever persists text-only prefixes, but different projectors
+    // CAN alter the text KV layout (M-RoPE, different projection matrices, etc.),
+    // so we REFUSE to cross-load snapshots from different projectors.
+    uint64_t fp_mmproj_hash     = 0; // hash of mmproj path (0 if no mmproj)
 
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
     // with a different block size cannot be longest-prefix-matched against the current index.
+    // NOTE: fp_n_ctx is intentionally EXCLUDED from the comparison: n_ctx can vary slightly across
+    // runs (e.g. padding/rounding) without invalidating the KV cache, and comparing it caused valid
+    // caches to be rejected (the KV is valid as long as model arch + RoPE settings match).
     bool operator==(const model_fp & o) const {
         return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
@@ -598,7 +600,7 @@ struct model_fp {
                fp_yarn_ext == o.fp_yarn_ext && fp_yarn_attn == o.fp_yarn_attn &&
                fp_yarn_beta_fast == o.fp_yarn_beta_fast && fp_yarn_beta_slow == o.fp_yarn_beta_slow &&
                fp_yarn_orig_ctx == o.fp_yarn_orig_ctx && fp_lora == o.fp_lora &&
-               fp_mmproj_loaded == o.fp_mmproj_loaded;
+               fp_mmproj_hash == o.fp_mmproj_hash;
     }
 };
 
@@ -615,12 +617,51 @@ static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
     return h;
 }
 
+// FNV-1a hash of a NUL-terminated C string (used to fold media chunk IDs into the block hash).
+// mtmd_input_chunk_get_id() returns the image/audio content hash (set by mtmd_helper_bitmap_init
+// from_buf to the FNV-1a of the raw bytes), so two different images yield different chunk IDs and
+// thus different block hashes — the core of media-aware cache key differentiation.
+static inline uint64_t auto_chunk_id_hash(const char * id) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (id) {
+        for (const char * p = id; *p; ++p) {
+            h ^= (uint64_t) (unsigned char) *p;
+            h *= 0x100000001b3ULL;
+        }
+    }
+    return h;
+}
+
+// Extract a (chunk-start-index -> content-hash) map from a prompt's media chunks. Used by the
+// auto disk cache so that two prompts with identical text tokens but different images produce
+// different block hashes (and thus different cache entries). Returns an empty map for text-only
+// prompts (has_media() == false). The hash is derived from the chunk's ID string
+// (mtmd_input_chunk_get_id), which is the FNV-1a of the raw image/audio bytes.
+static std::map<size_t, uint64_t> auto_media_hashes(const server_tokens & tokens) {
+    std::map<size_t, uint64_t> hashes;
+    if (!tokens.has_media()) {
+        return hashes;
+    }
+    for (const auto & [idx, chunk_ptr] : tokens.media_map()) {
+        const char * id = mtmd_input_chunk_get_id(chunk_ptr.get());
+        hashes[idx] = auto_chunk_id_hash(id);
+    }
+    return hashes;
+}
+
 // Returns, for each block boundary b in [1 .. n/B], the cumulative chain hash
 // committing to tokens[0 .. b*B). out[k] = hash of prefix length (k+1)*B. The
 // chain is salted with `salt` (the model fingerprint hash) so two different models
 // can never produce the same boundary hash for identical tokens. A trailing
 // partial block is NOT a boundary (only whole-block prefixes are index keys).
-static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt) {
+//
+// `media_hashes` maps a chunk's START token index to a content hash (auto_media_hashes).
+// At each NULL (LLAMA_TOKEN_NULL) position that is a chunk start, the chunk hash is folded
+// into the chain AFTER the token ID, so two prompts with the same text but different images
+// produce different block hashes. Interior NULL positions (non-start) have no media hash entry
+// and fold only the NULL token ID (identical for all images), preserving the chain position.
+static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt,
+                                                const std::map<size_t, uint64_t> & media_hashes) {
     std::vector<uint64_t> out;
     if (B <= 0) {
         return out;
@@ -629,6 +670,15 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B,
     uint64_t h = 0xcbf29ce484222325ULL ^ salt; // FNV offset basis, fingerprint-salted
     for (size_t i = 0; i < toks.size(); ++i) {
         h = auto_hash_mix(h, toks[i]);
+        // at a media chunk start, fold the chunk's content hash so that two prompts with
+        // identical text but different images produce different block hashes.
+        if (toks[i] == LLAMA_TOKEN_NULL) {
+            auto it = media_hashes.find(i);
+            if (it != media_hashes.end()) {
+                h = auto_hash_mix(h, (int32_t) (it->second & 0xFFFFFFFFu));
+                h = auto_hash_mix(h, (int32_t) (it->second >> 32));
+            }
+        }
         if ((i + 1) % (size_t) B == 0) {
             out.push_back(h);
         }
@@ -675,11 +725,15 @@ static std::string slot_meta_sidecar_path(const std::string & state_filepath) {
 
 // Best-effort atomic write of the .meta sidecar (LE, temp+rename — the exact idiom
 // of slot_logits_write). Layout: magic/version, fingerprint fields, tok_count,
-// chain_hash, then int32 tokens[tok_count]. Returns true on success. Never throws.
+// chain_hash, int32 tokens[tok_count], then media_hashes (n_media u32 + per-entry
+// position u64 + chunk_id_hash u64) so the startup scan can compute media-aware
+// block hashes without reading the multi-GB .bin or the .stokens chunk data.
+// Returns true on success. Never throws.
 static bool slot_meta_write(const std::string & state_filepath,
                             const model_fp & fp,
                             const llama_tokens & toks,
-                            uint64_t chain_hash) {
+                            uint64_t chain_hash,
+                            const std::map<size_t, uint64_t> & media_hashes) {
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
     const std::string tmp     = sidecar + ".tmp";
 
@@ -722,13 +776,21 @@ static bool slot_meta_write(const std::string & state_filepath,
     put_u32(fp.fp_yarn_beta_slow);
     put_u32(fp.fp_yarn_orig_ctx);
     put_u64(fp.fp_lora);
-    // mmproj deployment-shape bit — refuses cross-shape restores.
-    put_u32(fp.fp_mmproj_loaded);
+    // mmproj projector hash (u64): different projectors get disjoint stores.
+    put_u64(fp.fp_mmproj_hash);
     put_u32((uint32_t) toks.size());
     put_u64(chain_hash);
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    // media chunk content hashes: (start-index -> FNV of chunk ID) for each media chunk.
+    // Lets the scan compute media-aware block hashes (same text + different image = different
+    // key) without reading the .stokens sidecar. Text-only snapshots write an empty map.
+    put_u32((uint32_t) media_hashes.size());
+    for (const auto & [idx, hash] : media_hashes) {
+        put_u64((uint64_t) idx);
+        put_u64(hash);
+    }
     f.flush();
     if (!f.good()) {
         f.close();
@@ -746,15 +808,17 @@ static bool slot_meta_write(const std::string & state_filepath,
     return true;
 }
 
-// Read a .meta sidecar. Returns true and fills `fp_out` + `toks_out` iff a valid
-// sidecar exists. Any short read / bad magic / version mismatch => false with
+// Read a .meta sidecar. Returns true and fills `fp_out` + `toks_out` + `media_hashes_out`
+// iff a valid sidecar exists. Any short read / bad magic / version mismatch => false with
 // outputs cleared (invariant 4). Never throws. Note: `chain_hash` is recorded for
 // debuggability but the authority for reuse is always the byte-compared tokens.
 static bool slot_meta_read(const std::string & state_filepath,
                            model_fp & fp_out,
-                           llama_tokens & toks_out) {
+                           llama_tokens & toks_out,
+                           std::map<size_t, uint64_t> & media_hashes_out) {
     fp_out = model_fp{};
     toks_out.clear();
+    media_hashes_out.clear();
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
     std::ifstream f(sidecar, std::ios::binary);
     if (!f) {
@@ -794,8 +858,8 @@ static bool slot_meta_read(const std::string & state_filepath,
         // rope_freq_base + YaRN — must be read in the same order slot_meta_write emits.
         !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
         !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
-        // mmproj deployment-shape bit — read in the same order slot_meta_write emits.
-        !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
+        // mmproj projector hash (u64) — read in the same order slot_meta_write emits.
+        !get_u64(fp.fp_lora)          || !get_u64(fp.fp_mmproj_hash)   ||
         !get_u32(tok_count)           || !get_u64(chain_hash)) {
         return false;
     }
@@ -810,6 +874,26 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (f.gcount() != want) {
         toks_out.clear();
         return false;
+    }
+    // media chunk content hashes (start-index -> FNV of chunk ID). Written after the token array.
+    // A truncated v2 sidecar (no media hashes) is treated as an empty map (text-only snapshot).
+    uint32_t n_media = 0;
+    if (!get_u32(n_media)) {
+        fp_out = fp;
+        return true;
+    }
+    if (n_media > (1u << 24)) {
+        toks_out.clear();
+        return false; // sanity-bound
+    }
+    for (uint32_t i = 0; i < n_media; ++i) {
+        uint64_t idx = 0, hash = 0;
+        if (!get_u64(idx) || !get_u64(hash)) {
+            toks_out.clear();
+            media_hashes_out.clear();
+            return false;
+        }
+        media_hashes_out[(size_t) idx] = hash;
     }
     fp_out = fp;
     return true;
@@ -1764,9 +1848,17 @@ private:
         // LoRA: fingerprint the global adapter set so a snapshot under adapter A never restores
         // under B. (Per-request adapter overrides additionally gate at the restore hook.)
         fp.fp_lora        = auto_lora_hash(params_base.lora_adapters);
-        // deployment-shape bit (invariant 3): text-only server vs --mmproj server get
-        // disjoint stores (mmproj-aware rope/projector wiring can change the text KV layout).
-        fp.fp_mmproj_loaded = (mctx != nullptr) ? 1u : 0u;
+        // mmproj hash (invariant 3): different projectors get disjoint stores.
+        if (mctx != nullptr && !params_base.mmproj.path.empty()) {
+            // Hash the mmproj path to differentiate between different projectors
+            uint64_t h = 0xcbf29ce484222325ULL;
+            for (char c : params_base.mmproj.path) {
+                h ^= (uint64_t) (unsigned char) c; h *= 0x100000001b3ULL;
+            }
+            fp.fp_mmproj_hash = h;
+        } else {
+            fp.fp_mmproj_hash = 0;
+        }
         return fp;
     }
 
@@ -1860,20 +1952,21 @@ private:
             }
             model_fp fp;
             llama_tokens toks;
-            if (!slot_meta_read(p, fp, toks)) {
+            std::map<size_t, uint64_t> media_hashes;
+            if (!slot_meta_read(p, fp, toks, media_hashes)) {
                 SRV_INF("auto cache: skipping %s - no/short/corrupt meta\n", base.c_str());
                 continue;
             }
             if (!(fp == cur_fp)) {
                 SRV_INF("auto cache: skipping %s - fingerprint mismatch\n", base.c_str());
-                SRV_INF("  cached:  model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%u\n",
-                        (unsigned long)fp.fp_model, fp.fp_n_ctx_train, fp.fp_n_embd, fp.fp_n_layer, fp.fp_rope_type, fp.fp_n_ctx, fp.fp_kv_full, (unsigned long)fp.fp_block, (unsigned long)fp.fp_rope_scale, (unsigned long)fp.fp_rope_base, fp.fp_yarn_ext, fp.fp_yarn_attn, fp.fp_yarn_beta_fast, fp.fp_yarn_beta_slow, fp.fp_yarn_orig_ctx, (unsigned long)fp.fp_lora, fp.fp_mmproj_loaded);
-                SRV_INF("  current: model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%u\n",
-                        (unsigned long)cur_fp.fp_model, cur_fp.fp_n_ctx_train, cur_fp.fp_n_embd, cur_fp.fp_n_layer, cur_fp.fp_rope_type, cur_fp.fp_n_ctx, cur_fp.fp_kv_full, (unsigned long)cur_fp.fp_block, (unsigned long)cur_fp.fp_rope_scale, (unsigned long)cur_fp.fp_rope_base, cur_fp.fp_yarn_ext, cur_fp.fp_yarn_attn, cur_fp.fp_yarn_beta_fast, cur_fp.fp_yarn_beta_slow, cur_fp.fp_yarn_orig_ctx, (unsigned long)cur_fp.fp_lora, cur_fp.fp_mmproj_loaded);
+                SRV_INF("  cached:  model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%lu\n",
+                        (unsigned long)fp.fp_model, fp.fp_n_ctx_train, fp.fp_n_embd, fp.fp_n_layer, fp.fp_rope_type, fp.fp_n_ctx, fp.fp_kv_full, (unsigned long)fp.fp_block, (unsigned long)fp.fp_rope_scale, (unsigned long)fp.fp_rope_base, fp.fp_yarn_ext, fp.fp_yarn_attn, fp.fp_yarn_beta_fast, fp.fp_yarn_beta_slow, fp.fp_yarn_orig_ctx, (unsigned long)fp.fp_lora, (unsigned long)fp.fp_mmproj_hash);
+                SRV_INF("  current: model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope_type=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn_ext=%u yarn_attn=%u yarn_beta_fast=%u yarn_beta_slow=%u yarn_orig_ctx=%u lora=%lu mmproj=%lu\n",
+                        (unsigned long)cur_fp.fp_model, cur_fp.fp_n_ctx_train, cur_fp.fp_n_embd, cur_fp.fp_n_layer, cur_fp.fp_rope_type, cur_fp.fp_n_ctx, cur_fp.fp_kv_full, (unsigned long)cur_fp.fp_block, (unsigned long)cur_fp.fp_rope_scale, (unsigned long)cur_fp.fp_rope_base, cur_fp.fp_yarn_ext, cur_fp.fp_yarn_attn, cur_fp.fp_yarn_beta_fast, cur_fp.fp_yarn_beta_slow, cur_fp.fp_yarn_orig_ctx, (unsigned long)cur_fp.fp_lora, (unsigned long)cur_fp.fp_mmproj_hash);
                 continue;
             }
-            SRV_INF("auto cache: loaded %s (%zu tokens)\n", base.c_str(), toks.size());
-            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+            SRV_INF("auto cache: loaded %s (%zu tokens, %zu media chunks)\n", base.c_str(), toks.size(), media_hashes.size());
+            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model, media_hashes);
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
@@ -1887,7 +1980,7 @@ private:
     void auto_index_compact_after_save_locked(const std::string & new_path, const llama_tokens & toks,
                                                const std::vector<uint64_t> & bhs) {
         if (!params_base.slot_save_compact || bhs.empty()) return;
-        std::vector<std::pair<std::string, llama_tokens>> all_caches;
+        std::vector<std::tuple<std::string, llama_tokens, std::map<size_t, uint64_t>>> all_caches;
         std::error_code ec;
         for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
              !ec && it != end; it.increment(ec)) {
@@ -1900,14 +1993,15 @@ private:
             if (pbase.rfind("auto-", 0) != 0) continue;
             model_fp fp;
             llama_tokens meta_toks;
-            if (!slot_meta_read(p, fp, meta_toks)) continue;
+            std::map<size_t, uint64_t> meta_media;
+            if (!slot_meta_read(p, fp, meta_toks, meta_media)) continue;
             if (!(fp == cur_fp)) continue;
-            all_caches.push_back({p, std::move(meta_toks)});
+            all_caches.push_back({p, std::move(meta_toks), std::move(meta_media)});
         }
         std::unordered_set<std::string> to_delete;
-        for (const auto & [path, meta_toks] : all_caches) {
+        for (const auto & [path, meta_toks, meta_media] : all_caches) {
             if (meta_toks.size() >= toks.size()) continue;
-            const auto short_bhs = auto_block_hashes(meta_toks, params_base.slot_save_block, cur_fp.fp_model);
+            const auto short_bhs = auto_block_hashes(meta_toks, params_base.slot_save_block, cur_fp.fp_model, meta_media);
             bool is_prefix = true;
             for (size_t i = 0; i < short_bhs.size(); i++) {
                 if (i >= bhs.size() || short_bhs[i] != bhs[i]) {
@@ -1964,12 +2058,17 @@ private:
 
     // Longest-prefix lookup over the request tokens. Returns the candidate whose boundary hash is
     // the DEEPEST match with a fingerprint equal to the live one. Verification (byte-compare of the
-    // candidate's persisted tokens) is mandatory and done by the caller (invariant 2). O(#blocks).
-    std::optional<auto_cache_entry> auto_index_lookup(const llama_tokens & req) {
+    // candidate's persisted tokens AND media chunk hashes) is mandatory and done by the caller
+    // (invariant 2). O(#blocks). Media-aware: the block hash folds each image chunk's content hash
+    // (mtmd_input_chunk_get_id, an FNV of the raw image bytes) at the chunk's start position, so two
+    // prompts with identical text but different images produce different block hashes and match
+    // different cache entries.
+    std::optional<auto_cache_entry> auto_index_lookup(const server_tokens & req_tokens) {
         if (!auto_cache_enabled()) {
             return std::nullopt; // off by default
         }
-        const auto bhs = auto_block_hashes(req, params_base.slot_save_block, cur_fp.fp_model);
+        const auto media_hashes = auto_media_hashes(req_tokens);
+        const auto bhs = auto_block_hashes(req_tokens.get_tokens(), params_base.slot_save_block, cur_fp.fp_model, media_hashes);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         // Cross-process visibility: cheaply pick up snapshots a peer process created since our last
         // scan (throttled dir-mtime check). Then search; on a MISS, force a re-scan and search again
@@ -2121,25 +2220,51 @@ private:
         return true;
     }
 
-    // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens against the request prefix
-    // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the verified prefix length
-    // actually restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
-    // `req` is the full request token-ID array; `n_keep_mem` is the in-memory match to beat.
+    // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens AND media chunk hashes
+    // against the request prefix (invariant 2), confirm the fingerprint (invariant 3), then restore.
+    // Returns the verified prefix length actually restored, or 0 if nothing was restored (caller keeps
+    // the in-memory prefill path). `req_tokens` is the full request (server_tokens, with media chunks);
+    // `n_keep_mem` is the in-memory match to beat. Media-aware: two prompts with identical text but
+    // different images stop at the first differing image (the chunk content hash diverges), so they
+    // never cross-restore (invariant 2).
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
-                               const llama_tokens & req, int n_keep_mem) {
-        // read the small .meta sidecar (tokens + fp) — never opens the multi-GB state file (invariant 5).
+                               const server_tokens & req_tokens, int n_keep_mem) {
+        // read the small .meta sidecar (tokens + fp + media hashes) — never opens the multi-GB state file (invariant 5).
         model_fp disk_fp;
         llama_tokens disk_toks;
-        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+        std::map<size_t, uint64_t> disk_media;
+        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks, disk_media)) {
             return 0; // invariant 4
         }
         if (!(disk_fp == cur_fp)) {
             return 0; // invariant 3
         }
-        // byte-verify: longest common prefix of the persisted tokens and the request (invariant 2).
+        const llama_tokens & req = req_tokens.get_tokens();
+        const auto req_media = auto_media_hashes(req_tokens);
+        // byte-verify: longest common prefix of the persisted tokens and the request, comparing BOTH
+        // raw token IDs AND media chunk content hashes at NULL positions (invariant 2). A NULL-vs-NULL
+        // match is only a real match if both sides have the same chunk content hash at that position —
+        // otherwise two prompts with the same text but different images would falsely match.
         const size_t lim = std::min(disk_toks.size(), req.size());
         size_t v = 0;
-        while (v < lim && disk_toks[v] == req[v]) {
+        while (v < lim) {
+            if (disk_toks[v] != req[v]) {
+                break; // raw token mismatch
+            }
+            if (disk_toks[v] == LLAMA_TOKEN_NULL) {
+                // both are NULL — compare media chunk content hashes at this position
+                auto d_it = disk_media.find(v);
+                auto r_it = req_media.find(v);
+                if (d_it != disk_media.end() && r_it != req_media.end()) {
+                    if (d_it->second != r_it->second) {
+                        break; // different image at the same position
+                    }
+                } else if (d_it != disk_media.end() || r_it != req_media.end()) {
+                    break; // one has media, the other doesn't — mismatch
+                }
+                // neither has a media hash here (interior NULL of a chunk, or a text-only snapshot
+                // with NULLs but no chunk data): tokens match, continue.
+            }
             ++v;
         }
         SLT_INF(slot, "auto-restore debug: disk_toks.size()=%zu, req.size()=%zu, common_prefix=%zu\n", 
@@ -2169,6 +2294,20 @@ private:
                 n_keep_disk = (int) disk_toks.size();
             } else {
                 n_keep_disk = (int) (v - (v % (size_t) B));
+            }
+            // RS (bounded-rollback recurrent/hybrid, e.g. linear-attention models): the recurrent
+            // state can only rewind n_rs_seq tokens from the tail. Restoring a snapshot of size L and
+            // keeping n_past=v requires rolling back L-v tokens (seq_rm(v, -1) on the recurrent
+            // memory). If L-v exceeds n_rs_seq, the rollback aborts (common_context_seq_rm GGML_ABORTs).
+            // Refuse such restores and fall back to a normal prefill (invariant 4). The primary useful
+            // case for RS — the snapshot is a PREFIX of the request (v == L, no truncation) — is
+            // unaffected (rollback == 0).
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                if ((int) disk_toks.size() - (int) v > (int) llama_n_rs_seq(ctx_tgt)) {
+                    SLT_INF(slot, "auto-restore: refusing RS snapshot (rollback %zu > n_rs_seq %u), falling back to prefill\n",
+                            (size_t)((int) disk_toks.size() - (int) v), llama_n_rs_seq(ctx_tgt));
+                    return 0;
+                }
             }
         }
         if (n_keep_disk <= 0) {
@@ -2237,7 +2376,11 @@ private:
         if ((int) toks.size() < params_base.slot_save_block) {
             return; // < 1 block: not worth a multi-GB write
         }
-        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model);
+        // media-aware block hashes: fold each image chunk's content hash (mtmd_input_chunk_get_id,
+        // an FNV of the raw image bytes) into the chain at the chunk's start position, so two prompts
+        // with identical text but different images produce different cache keys.
+        const auto media_hashes = auto_media_hashes(slot.prompt.tokens);
+        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model, media_hashes);
         if (bhs.empty()) {
             return;
         }
@@ -2285,8 +2428,8 @@ private:
             const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
         }
-        // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST.
-        if (!slot_meta_write(tmp, cur_fp, toks, full_hash)) {
+        // 3) meta sidecar on the temp path (tokens + fingerprint + media hashes). Written but renamed LAST.
+        if (!slot_meta_write(tmp, cur_fp, toks, full_hash, media_hashes)) {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
@@ -4419,10 +4562,11 @@ private:
                     }
                     // write the meta file for manual saves, so they can be auto-restored
                     if (nwrite > 0) {
-                        const auto bhs = auto_block_hashes(tokens, params_base.slot_save_block, cur_fp.fp_model);
+                        const auto manual_media = auto_media_hashes(slot->prompt.tokens);
+                        const auto bhs = auto_block_hashes(tokens, params_base.slot_save_block, cur_fp.fp_model, manual_media);
                         if (!bhs.empty()) {
                             const uint64_t full_hash = bhs.back();
-                            if (!slot_meta_write(filepath, cur_fp, tokens, full_hash)) {
+                            if (!slot_meta_write(filepath, cur_fp, tokens, full_hash, manual_media)) {
                                 SLT_WRN(*slot, "%s", "failed to write meta sidecar for manual save\n");
                             }
                         }
@@ -5071,10 +5215,11 @@ private:
                                         && slot.task->need_sampling()        // generative only (not embed/rerank)
                                         && slot.alora_invocation_start <= 0      // aLoRA caching bound (mirror below)
                                         && are_lora_equal(slot.lora, params_base.lora_adapters)) { // fp captures global LoRA (invariant 3)
-                                    // get_tokens() includes NULL placeholders for image positions, matching
-                                    // the token array saved by auto-save (which also uses get_tokens()).
-                                    const llama_tokens req = input_tokens.get_tokens();
-                                    if (auto cand = auto_index_lookup(req)) {
+                                    // auto_index_lookup / auto_restore_into_slot use server_tokens (not raw
+                                    // token IDs) so the block hash and byte-verify are media-aware: two
+                                    // prompts with identical text but different images get different cache
+                                    // keys and never cross-restore (invariant 2).
+                                    if (auto cand = auto_index_lookup(input_tokens)) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -5086,7 +5231,7 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        auto_restore_into_slot(slot, *cand, req, (int) n_past);
+                                        auto_restore_into_slot(slot, *cand, input_tokens, (int) n_past);
                                         SLT_INF(slot, "auto-restore debug: after restore slot.prompt.tokens.size()=%zu has_mtmd=%d, input_tokens.size()=%zu has_mtmd=%d\n",
                                                 slot.prompt.tokens.size(), slot.prompt.tokens.has_mtmd, input_tokens.size(), input_tokens.has_mtmd);
                                         // Compare first few tokens to see where they differ
@@ -5471,8 +5616,24 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
+                    // Use llama_memory_seq_rm directly (returns bool) instead of common_context_seq_rm
+                    // (which GGML_ABORTs on failure) so we can fall back gracefully. A partial seq_rm
+                    // can fail for hybrid/RS (bounded-rollback) models when the auto disk cache restores
+                    // a longer snapshot and the request diverges early: the recurrent state can only
+                    // rewind n_rs_seq tokens from the tail, so removing [p0, end) with a large gap
+                    // aborts. The auto-restore RS check should normally prevent this, but this is a
+                    // defense-in-depth: on failure, clear the entire sequence and re-prefill from scratch
+                    // (invariant 4: never crash).
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                        SLT_WRN(slot, "partial seq_rm [%d, end) failed (RS rollback bound exceeded?); clearing sequence and re-prefilling\n", p0);
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft, slot.id, -1, -1);
+                        }
+                        slot.prompt.tokens.clear();
+                        slot.prompt.checkpoints.clear();
+                        slot.n_prompt_tokens_cache = 0;
+                    } else if (ctx_dft) {
                         common_context_seq_rm(ctx_dft, slot.id, p0, -1);
                     }
 

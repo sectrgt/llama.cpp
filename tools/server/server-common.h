@@ -204,6 +204,11 @@ public:
     // prompt contains ANY media chunk (image/audio); a text-only prompt has an empty media map.
     bool has_media() const { return !map_idx_to_media.empty(); }
 
+    // read-only access to the media chunk map (start-index -> chunk), used by the auto disk
+    // cache to compute media-aware block hashes so that two prompts with identical text but
+    // different images get different cache keys.
+    const std::map<size_t, mtmd::input_chunk_ptr> & media_map() const { return map_idx_to_media; }
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
