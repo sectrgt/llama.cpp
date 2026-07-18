@@ -694,7 +694,8 @@ struct common_params {
     // end of each generated response, if this many seconds have elapsed since the slot's KV was
     // last persisted to disk, auto_save_slot_if_useful is called. This bounds data loss on a
     // crash to at most one interval of work without forcing a multi-GB write on every response.
-    // 0 = flush on every task completion (no interval gating). Default: 1800 (30 min).
+    // 0 = flush on every task completion (no interval gating). -1 = disable periodic flush.
+    // Default: 1800 (30 min).
     int32_t slot_save_flush_interval_sec = 1800;
     std::string media_path; // path to directory for loading media files
 

@@ -3347,10 +3347,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("minimum seconds between automatic disk flushes of a slot's KV on task completion; "
                       "at the end of each generated response, if this many seconds have elapsed since the "
                       "slot's KV was last persisted to disk, it is flushed (0 = flush on every completion, "
-                      "default: %d). Requires --slot-save-auto.", params.slot_save_flush_interval_sec),
+                      "-1 = disable periodic flush, default: %d). Requires --slot-save-auto.", params.slot_save_flush_interval_sec),
         [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("--slot-save-flush-interval must be >= 0");
+            if (value < -1) {
+                throw std::invalid_argument("--slot-save-flush-interval must be >= -1");
             }
             params.slot_save_flush_interval_sec = value;
         }

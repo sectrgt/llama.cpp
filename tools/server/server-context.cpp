@@ -2897,12 +2897,15 @@ private:
                 // auto-save site that fires when no new task arrives to reassign the slot — without
                 // it, a slot that finishes generating and then sits idle is never persisted until the
                 // next request (or shutdown), so a crash in between loses the entire response.
+                // -1 = disable periodic flush (set to max int32).
                 if (auto_cache_enabled() && params_base.slot_save_flush_interval_sec >= 0) {
                     server_slot * s = get_slot_by_id(id_slot);
                     if (s) {
                         const int64_t now = ggml_time_us();
-                        const int64_t interval_us =
-                            (int64_t) params_base.slot_save_flush_interval_sec * 1000000;
+                        // -1 is mapped to INT32_MAX to disable the flush
+                        const int64_t interval_sec = params_base.slot_save_flush_interval_sec == -1
+                            ? INT32_MAX : params_base.slot_save_flush_interval_sec;
+                        const int64_t interval_us = interval_sec * 1000000;
                         if (s->last_disk_save_time < 0 || now - s->last_disk_save_time >= interval_us) {
                             auto_save_slot_if_useful(*s);
                         }
