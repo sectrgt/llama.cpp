@@ -1296,6 +1296,55 @@ json oaicompat_chat_params_parse(
         llama_params["__prefill_reasoning"] = prefill_reasoning_text;
         llama_params["__prefill_content"] = prefill_content_text;
         llama_params["__prefill_case"] = prefill_case;
+        llama_params["__prefill_is_continuation"] = true;
+    }
+
+    // For prefill cases, construct a generation_prompt for the PEG parser that includes
+    // the prefilled reasoning/content.  This allows common_chat_parse() to see
+    // prefill_text + generated_text and correctly parse reasoning, content, AND tool
+    // calls (instead of the old manual splitting that bypassed the parser).
+    //
+    // The PEG parser prepends chat_parser_params.generation_prompt to the generated
+    // text and parses the result.  By setting it to the prefill text, the parser
+    // sees the full assistant turn (prefill + generation) and extracts tool calls.
+    //
+    // We also set is_continuation=true so task_result_state initialises chat_msg
+    // with the parsed prefill, making streaming diffs exclude the prefill.
+    std::string generation_prompt_for_parser = chat_params.generation_prompt;
+    if (prefill_case != 0) {
+        const std::string & thinking_start = chat_params.thinking_start_tag;
+        const std::string & thinking_end   = chat_params.thinking_end_tag;
+        const std::string & gen_prompt     = chat_params.generation_prompt;
+
+        // Determine the assistant prefix (everything before the thinking start tag)
+        bool has_thinking    = !thinking_start.empty()
+                               && gen_prompt.find(thinking_start) != std::string::npos;
+        std::string assistant_prefix = has_thinking
+            ? gen_prompt.substr(0, gen_prompt.find(thinking_start))
+            : gen_prompt;
+
+        // If the generation_prompt already includes the thinking start tag (has_thinking),
+        // we append to gen_prompt; otherwise we must insert thinking_start ourselves.
+        std::string thinking_start_suffix = has_thinking ? "" : thinking_start;
+
+        switch (prefill_case) {
+            case 1: // reasoning only — keep reasoning block open
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text;
+                break;
+            case 2: // reasoning + content — close reasoning, continue content
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text
+                                              + thinking_end + prefill_content_text;
+                break;
+            case 3: // content only — no reasoning block
+                generation_prompt_for_parser = assistant_prefix + prefill_content_text;
+                break;
+            case 4: // reasoning + empty content — close reasoning, generate content
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text
+                                              + thinking_end;
+                break;
+            default:
+                break;
+        }
     }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
@@ -1312,7 +1361,7 @@ json oaicompat_chat_params_parse(
     }
     llama_params["grammar_triggers"]  = grammar_triggers;
     llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
-    llama_params["generation_prompt"] = chat_params.generation_prompt;
+    llama_params["generation_prompt"] = generation_prompt_for_parser;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }

@@ -949,8 +949,6 @@ struct server_slot {
     std::string prefill_content;
     llama_tokens prefill_tokens;
     size_t prefill_idx = 0;
-    std::string prefill_opening_sequence;
-    std::string prefill_closing_sequence;  // Closing tag for reasoning block (extracted from template)
 
     std::vector<completion_token_output> generated_token_probs;
 
@@ -1103,8 +1101,6 @@ struct server_slot {
         prefill_content.clear();
         prefill_tokens.clear();
         prefill_idx = 0;
-        prefill_opening_sequence.clear();
-        prefill_closing_sequence.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -3537,31 +3533,6 @@ private:
             }
         }
 
-        // Store opening sequence for Case 1 parsing (needed for reasoning/content separation)
-        if (prefill_case == 1 && !opening_tokens.empty()) {
-            slot.prefill_opening_sequence.clear();
-            for (auto tok : opening_tokens) {
-                slot.prefill_opening_sequence += common_token_to_piece(vocab, tok, true);
-            }
-            SLT_DBG(slot, "Stored opening sequence for Case 1 parsing: %s\n",
-                    slot.prefill_opening_sequence.c_str());
-            
-            // For Case 1, extract the closing sequence (tokens between reasoning and content placeholders)
-            // This identifies where reasoning ends and content begins
-            if (reasoning_start != std::string::npos && content_start != std::string::npos &&
-                content_start > reasoning_start) {
-                size_t reasoning_end = reasoning_start + reasoning_placeholder_tokens.size();
-                if (reasoning_end < content_start) {
-                    slot.prefill_closing_sequence.clear();
-                    for (size_t i = reasoning_end; i < content_start; i++) {
-                        slot.prefill_closing_sequence += common_token_to_piece(vocab, placeholder_tokens[i], true);
-                    }
-                    SLT_DBG(slot, "Stored closing sequence for Case 1 parsing: %s\n",
-                            slot.prefill_closing_sequence.c_str());
-                }
-            }
-        }
-
         // Tokenize the actual prefill content
         llama_tokens actual_reasoning_tokens = common_tokenize(vocab, prefill_reasoning_content, false, true);
         llama_tokens actual_content_tokens = common_tokenize(vocab, prefill_content, false, true);
@@ -4013,8 +3984,6 @@ private:
 
         // Pass prefill state for reasoning content handling
         res->prefill_case = slot.prefill_case;
-        res->prefill_opening_sequence = slot.prefill_opening_sequence;
-        res->prefill_closing_sequence = slot.prefill_closing_sequence;
         res->prefill_reasoning_content = slot.prefill_reasoning_content;
         res->prefill_content = slot.prefill_content;
         res->return_prefill = slot.return_prefill;
@@ -4105,8 +4074,6 @@ private:
 
         // Pass prefill state for reasoning content handling
         res->prefill_case = slot.prefill_case;
-        res->prefill_opening_sequence = slot.prefill_opening_sequence;
-        res->prefill_closing_sequence = slot.prefill_closing_sequence;
         res->prefill_reasoning_content = slot.prefill_reasoning_content;
         res->prefill_content = slot.prefill_content;
         res->return_prefill = slot.return_prefill;

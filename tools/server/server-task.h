@@ -125,8 +125,6 @@ struct task_result_state {
 
     // Prefill state for reasoning content handling
     int32_t prefill_case = 0;  // 0 = no prefill, 1-4 = prefill cases
-    std::string prefill_opening_sequence;
-    std::string prefill_closing_sequence;  // Closing tag for reasoning block (case 1)
     std::string prefill_reasoning_content;
     std::string prefill_content;
     bool return_prefill = false;
@@ -146,14 +144,10 @@ struct task_result_state {
 inline void copy_prefill_state_to_result(
         task_result_state & state,
         int32_t prefill_case,
-        const std::string & prefill_opening_sequence,
-        const std::string & prefill_closing_sequence,
         const std::string & prefill_reasoning_content,
         const std::string & prefill_content,
         bool return_prefill) {
     state.prefill_case = prefill_case;
-    state.prefill_opening_sequence = prefill_opening_sequence;
-    state.prefill_closing_sequence = prefill_closing_sequence;
     state.prefill_reasoning_content = prefill_reasoning_content;
     state.prefill_content = prefill_content;
     state.return_prefill = return_prefill;
@@ -408,8 +402,6 @@ struct server_task_result_cmpl_final : server_task_result {
 
     // Prefill state for reasoning content handling (passed from slot)
     int prefill_case = 0;
-    std::string prefill_opening_sequence;
-    std::string prefill_closing_sequence;
     std::string prefill_reasoning_content;
     std::string prefill_content;
     bool return_prefill = false;
@@ -423,20 +415,21 @@ struct server_task_result_cmpl_final : server_task_result {
     virtual void update(task_result_state & state) override {
         is_updated = true;
         // Pass prefill state to the state object before parsing
-        copy_prefill_state_to_result(state, prefill_case, prefill_opening_sequence, prefill_closing_sequence,
-                                     prefill_reasoning_content, prefill_content, return_prefill);
+        copy_prefill_state_to_result(state, prefill_case, prefill_reasoning_content, prefill_content, return_prefill);
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
-        // If return_prefill is true, prepend the prefilled content to the message
-        // This is done AFTER parsing so the parser only works with newly generated content
-        if (return_prefill && prefill_case > 0) {
-            // For reasoning cases (1, 2, 4), prepend prefilled reasoning
-            if (!prefill_reasoning_content.empty()) {
-                oaicompat_msg.reasoning_content = prefill_reasoning_content + oaicompat_msg.reasoning_content;
+        // With is_continuation=true (set for prefill cases), common_chat_parse processes
+        // prefill_text + generated_text, so oaicompat_msg already includes the prefilled
+        // reasoning/content.  When return_prefill is false we must strip the prefill so
+        // the client only sees the newly generated text.
+        if (!return_prefill && prefill_case > 0) {
+            if (!prefill_reasoning_content.empty()
+                && oaicompat_msg.reasoning_content.find(prefill_reasoning_content) == 0) {
+                oaicompat_msg.reasoning_content.erase(0, prefill_reasoning_content.size());
             }
-            // For content cases (2, 3), prepend prefilled content
-            if (!prefill_content.empty()) {
-                oaicompat_msg.content = prefill_content + oaicompat_msg.content;
+            if (!prefill_content.empty()
+                && oaicompat_msg.content.find(prefill_content) == 0) {
+                oaicompat_msg.content.erase(0, prefill_content.size());
             }
         }
 
@@ -506,8 +499,6 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     // Prefill state for reasoning content handling (passed from slot)
     int prefill_case = 0;
-    std::string prefill_opening_sequence;
-    std::string prefill_closing_sequence;
     std::string prefill_reasoning_content;
     std::string prefill_content;
     bool return_prefill = false;
