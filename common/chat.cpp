@@ -250,6 +250,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
             if (!tool_call.id.empty()) {
                 tc["id"] = tool_call.id;
             }
+            if (!tool_call.raw.empty()) {
+                tc["__raw"] = tool_call.raw;
+            }
             // Some templates generate and require an id (sometimes in a very specific format, e.g. Mistral Nemo).
             // We only generate a random id for the ones that don't generate one by themselves
             // (they also won't get to see it as their template likely doesn't use it, so it's all for the client)
@@ -310,7 +313,8 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
             }
         }
         const auto args_diff = string_diff(pref.arguments, newf.arguments);
-        if (!args_diff.empty() || pref.id != newf.id || pref.name != newf.name) {
+        const auto raw_diff  = string_diff(pref.raw, newf.raw);
+        if (!args_diff.empty() || !raw_diff.empty() || pref.id != newf.id || pref.name != newf.name) {
             auto & diff          = diffs.emplace_back();
             diff.tool_call_index = idx;
             if (pref.id != newf.id || pref.name != newf.name) {
@@ -318,6 +322,7 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
                 diff.tool_call_delta.name = newf.name;
             }
             diff.tool_call_delta.arguments = args_diff;
+            diff.tool_call_delta.raw       = raw_diff;
         }
     }
     for (size_t idx = msg_prv.tool_calls.size(); idx < msg_new.tool_calls.size(); ++idx) {
@@ -388,6 +393,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
 
             auto has_content    = message.contains("content");
             auto has_tool_calls = message.contains("tool_calls");
+            auto has_tool_calls_raw = message.contains("tool_calls_raw");
             if (has_content) {
                 const auto & content = message.at("content");
                 if (content.is_string()) {
@@ -443,13 +449,16 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                 }
             }
             auto has_reasoning_content = message.contains("reasoning_content") && !message.at("reasoning_content").is_null();
-            if (!has_content && !has_tool_calls && !has_reasoning_content) {
+            if (!has_content && !has_tool_calls && !has_tool_calls_raw && !has_reasoning_content) {
                 throw std::invalid_argument(
-                    "Expected 'content', 'tool_calls', or 'reasoning_content' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
+                    "Expected 'content', 'tool_calls', 'tool_calls_raw', or 'reasoning_content' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
                     "https://github.com/ggml-org/llama.cpp/issues/12279)");
             }
             if (message.contains("reasoning_content")) {
                 msg.reasoning_content = message.at("reasoning_content");
+            }
+            if (has_tool_calls_raw && !message.at("tool_calls_raw").is_null()) {
+                msg.tool_calls_raw = message.at("tool_calls_raw").get<std::string>();
             }
             if (message.contains("name")) {
                 msg.tool_name = message.at("name");
@@ -3127,9 +3136,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             msg.role = "assistant";
             std::unique_ptr<common_chat_peg_mapper> mapper;
             if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg, effective_input);
             } else {
-                mapper = std::make_unique<common_chat_peg_mapper>(msg);
+                mapper = std::make_unique<common_chat_peg_mapper>(msg, effective_input);
             }
             mapper->from_ast(ctx.ast, result);
 
@@ -3149,9 +3158,9 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
 
     std::unique_ptr<common_chat_peg_mapper> mapper;
     if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-        mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+        mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg, effective_input);
     } else {
-        mapper = std::make_unique<common_chat_peg_mapper>(msg);
+        mapper = std::make_unique<common_chat_peg_mapper>(msg, effective_input);
     }
     mapper->from_ast(ctx.ast, result);
 

@@ -29,9 +29,10 @@ struct common_chat_tool_call {
     std::string name;
     std::string arguments;
     std::string id;
+    std::string raw;   // exact raw model-format text for this tool call
 
     bool operator==(const common_chat_tool_call & other) const {
-        return name == other.name && arguments == other.arguments && id == other.id;
+        return name == other.name && arguments == other.arguments && id == other.id && raw == other.raw;
     }
 };
 
@@ -86,6 +87,7 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
+    std::string                               tool_calls_raw;   // raw model-format tool tokens for prefill
 
     nlohmann::ordered_json to_json_oaicompat(bool concat_typed_text = false) const;
 

@@ -152,6 +152,7 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
         // initialize chat_msg to avoid emitting a delta containing the assistant prefill
         chat_msg = common_chat_parse("", true, chat_parser_params);
+        prefill_tool_calls_count = chat_msg.tool_calls.size();
     }
 }
 
@@ -194,6 +195,7 @@ common_chat_msg task_result_state::update_chat_msg(
                         header.tool_call_index      = i;
                         header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                         header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.raw  = chat_msg.tool_calls[i].raw;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }
@@ -230,6 +232,7 @@ common_chat_msg task_result_state::update_chat_msg(
                         header.tool_call_index      = i;
                         header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                         header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.raw  = chat_msg.tool_calls[i].raw;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }
@@ -1024,7 +1027,8 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
     // Pass prefill state to the state object before parsing
-    copy_prefill_state_to_result(state, prefill_case, prefill_reasoning_content, prefill_content, return_prefill);
+    copy_prefill_state_to_result(state, prefill_case, prefill_reasoning_content, prefill_content, return_prefill,
+                                 prefill_has_tool_calls, prefill_tool_calls_raw, prefill_tool_calls_structured);
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
@@ -1034,7 +1038,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     // the parsed prefill, so diffs naturally exclude the prefill.  When return_prefill
     // is true we must emit the prefill as a synthetic first delta so the streaming
     // client receives it.
-    if (return_prefill && prefill_case > 0 && n_decoded == 1) {
+    if (return_prefill && n_decoded == 1 && (prefill_case > 0 || prefill_has_tool_calls)) {
         std::vector<common_chat_msg_diff> prefill_diffs;
         if (!prefill_reasoning_content.empty()) {
             common_chat_msg_diff d;
@@ -1045,6 +1049,14 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
             common_chat_msg_diff d;
             d.content_delta = prefill_content;
             prefill_diffs.push_back(std::move(d));
+        }
+        if (prefill_has_tool_calls && !prefill_tool_calls_structured.empty()) {
+            for (size_t i = 0; i < prefill_tool_calls_structured.size(); ++i) {
+                common_chat_msg_diff d;
+                d.tool_call_index = i;
+                d.tool_call_delta = prefill_tool_calls_structured[i];
+                prefill_diffs.push_back(std::move(d));
+            }
         }
         if (!prefill_diffs.empty()) {
             oaicompat_msg_diffs.insert(oaicompat_msg_diffs.begin(),

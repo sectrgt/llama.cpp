@@ -947,6 +947,10 @@ struct server_slot {
     int32_t prefill_case = 0;  // 0 = no prefill, 1-4 = prefill cases
     std::string prefill_reasoning_content;
     std::string prefill_content;
+    bool prefill_has_tool_calls = false;
+    std::string prefill_tool_calls_raw;
+    std::string prefill_assistant_prefix;
+    std::vector<common_chat_tool_call> prefill_tool_calls_structured;
     llama_tokens prefill_tokens;
     size_t prefill_idx = 0;
 
@@ -1099,6 +1103,9 @@ struct server_slot {
         prefill_case = 0;
         prefill_reasoning_content.clear();
         prefill_content.clear();
+        prefill_has_tool_calls = false;
+        prefill_tool_calls_raw.clear();
+        prefill_assistant_prefix.clear();
         prefill_tokens.clear();
         prefill_idx = 0;
 
@@ -3604,14 +3611,30 @@ private:
         }
 
         // Handle prefill if present (cases 1-4)
-        if (task.data.contains("__prefill_case") && task.data["__prefill_case"].get<int>() != 0) {
+        if ((task.data.contains("__prefill_case") && task.data["__prefill_case"].get<int>() != 0) ||
+            (task.data.contains("__prefill_has_tool_calls") && task.data["__prefill_has_tool_calls"].get<bool>())) {
             slot.prefill_case = json_value(task.data, "__prefill_case", 0);
             bool prefill_with_reasoning = json_value(task.data, "__prefill_has_reasoning", false);
             slot.prefill_reasoning_content = json_value(task.data, "__prefill_reasoning", std::string());
             slot.prefill_content = json_value(task.data, "__prefill_content", std::string());
+            slot.prefill_has_tool_calls = json_value(task.data, "__prefill_has_tool_calls", false);
+            slot.prefill_tool_calls_raw = json_value(task.data, "__prefill_tool_calls_raw", std::string());
+            slot.prefill_assistant_prefix = json_value(task.data, "__prefill_assistant_prefix", std::string());
+            if (task.data.contains("__prefill_tool_calls_structured")) {
+                const auto & jtcs = task.data.at("__prefill_tool_calls_structured");
+                for (const auto & jtc : jtcs) {
+                    common_chat_tool_call tc;
+                    tc.id = jtc.value("id", std::string());
+                    const auto & fn = jtc.at("function");
+                    tc.name = fn.at("name");
+                    const auto & args = fn.at("arguments");
+                    tc.arguments = args.is_string() ? args.get<std::string>() : args.dump();
+                    slot.prefill_tool_calls_structured.push_back(tc);
+                }
+            }
 
-            SLT_INF(slot, "Setting up prefill, case=%d, prefill_with_reasoning=%d\n",
-                    slot.prefill_case, (int)prefill_with_reasoning);
+            SLT_INF(slot, "Setting up prefill, case=%d, prefill_with_reasoning=%d, has_tool_calls=%d\n",
+                    slot.prefill_case, (int)prefill_with_reasoning, (int)slot.prefill_has_tool_calls);
 
             if (chat_params.tmpls) {
                 bool success = build_prefill_tokens(slot, slot.prefill_case, prefill_with_reasoning,
@@ -3620,6 +3643,25 @@ private:
                     SRV_ERR("Failed to build prefill tokens, case=%d\n", slot.prefill_case);
                     slot.has_prefill = false;
                     slot.prefill_case = 0;
+                    slot.prefill_has_tool_calls = false;
+                    slot.prefill_tool_calls_raw.clear();
+                    slot.prefill_assistant_prefix.clear();
+                }
+                // Append raw tool-call tokens at the end of the prefill sequence.
+                if (success && slot.prefill_has_tool_calls && !slot.prefill_tool_calls_raw.empty()) {
+                    // For tool-call-only prefill (no reasoning/content case), build_prefill_tokens
+                    // leaves prefill_tokens empty.  We must prepend the assistant prefix so the
+                    // model sees a complete assistant turn.
+                    if (slot.prefill_tokens.empty() && !slot.prefill_assistant_prefix.empty()) {
+                        auto prefix_tokens = common_tokenize(vocab, slot.prefill_assistant_prefix, false, true);
+                        slot.prefill_tokens.insert(slot.prefill_tokens.end(),
+                                                   prefix_tokens.begin(), prefix_tokens.end());
+                    }
+                    auto tool_call_tokens = common_tokenize(vocab, slot.prefill_tool_calls_raw, false, true);
+                    slot.prefill_tokens.insert(slot.prefill_tokens.end(),
+                                               tool_call_tokens.begin(), tool_call_tokens.end());
+                    slot.has_prefill = true;
+                    SLT_DBG(slot, "Appended %zu tool-call prefill tokens\n", tool_call_tokens.size());
                 }
             } else {
                 SRV_WRN("Chat templates not available for reasoning prefill, case=%d\n", slot.prefill_case);
@@ -3988,6 +4030,11 @@ private:
         res->prefill_content = slot.prefill_content;
         res->return_prefill = slot.return_prefill;
 
+        // Pass prefill state for tool-call handling
+        res->prefill_has_tool_calls = slot.prefill_has_tool_calls;
+        res->prefill_tool_calls_raw = slot.prefill_tool_calls_raw;
+        res->prefill_tool_calls_structured = slot.prefill_tool_calls_structured;
+
         res->verbose           = slot.task->params.verbose;
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
@@ -4077,6 +4124,11 @@ private:
         res->prefill_reasoning_content = slot.prefill_reasoning_content;
         res->prefill_content = slot.prefill_content;
         res->return_prefill = slot.return_prefill;
+
+        // Pass prefill state for tool-call handling
+        res->prefill_has_tool_calls = slot.prefill_has_tool_calls;
+        res->prefill_tool_calls_raw = slot.prefill_tool_calls_raw;
+        res->prefill_tool_calls_structured = slot.prefill_tool_calls_structured;
 
         queue_results.send(std::move(res));
     }
