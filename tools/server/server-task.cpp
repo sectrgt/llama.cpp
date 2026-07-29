@@ -1028,7 +1028,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
     // Pass prefill state to the state object before parsing
     copy_prefill_state_to_result(state, prefill_case, prefill_reasoning_content, prefill_content, return_prefill,
-                                 prefill_has_tool_calls, prefill_tool_calls_raw, prefill_tool_calls_structured);
+                                 prefill_has_tool_calls, prefill_tool_calls_partial, prefill_tool_calls_raw, prefill_tool_calls_structured);
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }

@@ -1332,6 +1332,46 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // If the raw tool-call prefill does not end at a tool-call boundary, treat it as
+    // partial.  The tool-call grammar is built for generated text that starts fresh, so
+    // it would force the model to regenerate the prefix.  Disable the grammar for partial
+    // raw prefill and let the model continue the raw tokens; the PEG parser will extract
+    // the completed tool call(s) afterwards.
+    bool prefill_tool_calls_partial = false;
+    if (prefill_has_tool_calls && !prefill_tool_calls_raw.empty() && !prefill_tool_calls_is_structured) {
+        const auto & raw = prefill_tool_calls_raw;
+        bool ends_at_call_boundary = false;
+        if (!chat_params.tool_per_call_end.empty()) {
+            ends_at_call_boundary = raw.size() >= chat_params.tool_per_call_end.size()
+                && raw.compare(raw.size() - chat_params.tool_per_call_end.size(),
+                               chat_params.tool_per_call_end.size(),
+                               chat_params.tool_per_call_end) == 0;
+        } else if (!chat_params.tool_section_end.empty()) {
+            ends_at_call_boundary = raw.size() >= chat_params.tool_section_end.size()
+                && raw.compare(raw.size() - chat_params.tool_section_end.size(),
+                               chat_params.tool_section_end.size(),
+                               chat_params.tool_section_end) == 0;
+        } else if (chat_params.tool_format_mode == 1) {
+            // JSON_NATIVE: raw prefill should be valid JSON if complete.
+            try {
+                auto j = json::parse(raw);
+                ends_at_call_boundary = j.is_array();
+            } catch (...) {
+                ends_at_call_boundary = false;
+            }
+        } else {
+            // No clear boundary markers; conservatively assume complete.
+            ends_at_call_boundary = true;
+        }
+        prefill_tool_calls_partial = !ends_at_call_boundary;
+        if (prefill_tool_calls_partial) {
+            SRV_INF("%s", "Detected partial tool_calls_raw prefill; disabling tool-call grammar");
+            chat_params.grammar.clear();
+            chat_params.grammar_lazy = false;
+            chat_params.grammar_triggers.clear();
+        }
+    }
+
     // Pass prefill data to slot for ALL prefill cases (cases 1-4)
     if (prefill_case != 0 || prefill_has_tool_calls) {
         llama_params["__prefill_has_reasoning"] = prefill_with_reasoning;
@@ -1341,6 +1381,7 @@ json oaicompat_chat_params_parse(
         llama_params["__prefill_is_continuation"] = true;
         llama_params["__prefill_has_tool_calls"] = prefill_has_tool_calls;
         llama_params["__prefill_tool_calls_raw"] = prefill_tool_calls_raw;
+        llama_params["__prefill_tool_calls_partial"] = prefill_tool_calls_partial;
         llama_params["__prefill_assistant_prefix"] = assistant_prefix;
         if (prefill_tool_calls_is_structured) {
             llama_params["__prefill_tool_calls_structured"] = common_chat_msgs_to_json_oaicompat({last_message}, false).at(0).at("tool_calls");
@@ -1397,7 +1438,8 @@ json oaicompat_chat_params_parse(
 
         // Append raw tool-call tokens at the end of the assistant prefill.
         // If the reasoning block was left open (case 1), close it first.
-        if (prefill_has_tool_calls) {
+        // For tool-call-only prefill (case 0) the raw tokens are already included above.
+        if (prefill_has_tool_calls && prefill_case != 0) {
             if (prefill_case == 1) {
                 generation_prompt_for_parser += thinking_end;
             }

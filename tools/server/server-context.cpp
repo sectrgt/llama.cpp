@@ -948,6 +948,7 @@ struct server_slot {
     std::string prefill_reasoning_content;
     std::string prefill_content;
     bool prefill_has_tool_calls = false;
+    bool prefill_tool_calls_partial = false;
     std::string prefill_tool_calls_raw;
     std::string prefill_assistant_prefix;
     std::vector<common_chat_tool_call> prefill_tool_calls_structured;
@@ -1104,6 +1105,7 @@ struct server_slot {
         prefill_reasoning_content.clear();
         prefill_content.clear();
         prefill_has_tool_calls = false;
+        prefill_tool_calls_partial = false;
         prefill_tool_calls_raw.clear();
         prefill_assistant_prefix.clear();
         prefill_tokens.clear();
@@ -3618,6 +3620,7 @@ private:
             slot.prefill_reasoning_content = json_value(task.data, "__prefill_reasoning", std::string());
             slot.prefill_content = json_value(task.data, "__prefill_content", std::string());
             slot.prefill_has_tool_calls = json_value(task.data, "__prefill_has_tool_calls", false);
+            slot.prefill_tool_calls_partial = json_value(task.data, "__prefill_tool_calls_partial", false);
             slot.prefill_tool_calls_raw = json_value(task.data, "__prefill_tool_calls_raw", std::string());
             slot.prefill_assistant_prefix = json_value(task.data, "__prefill_assistant_prefix", std::string());
             if (task.data.contains("__prefill_tool_calls_structured")) {
@@ -3644,6 +3647,7 @@ private:
                     slot.has_prefill = false;
                     slot.prefill_case = 0;
                     slot.prefill_has_tool_calls = false;
+                    slot.prefill_tool_calls_partial = false;
                     slot.prefill_tool_calls_raw.clear();
                     slot.prefill_assistant_prefix.clear();
                 }
@@ -4032,6 +4036,7 @@ private:
 
         // Pass prefill state for tool-call handling
         res->prefill_has_tool_calls = slot.prefill_has_tool_calls;
+        res->prefill_tool_calls_partial = slot.prefill_tool_calls_partial;
         res->prefill_tool_calls_raw = slot.prefill_tool_calls_raw;
         res->prefill_tool_calls_structured = slot.prefill_tool_calls_structured;
 
@@ -4127,6 +4132,7 @@ private:
 
         // Pass prefill state for tool-call handling
         res->prefill_has_tool_calls = slot.prefill_has_tool_calls;
+        res->prefill_tool_calls_partial = slot.prefill_tool_calls_partial;
         res->prefill_tool_calls_raw = slot.prefill_tool_calls_raw;
         res->prefill_tool_calls_structured = slot.prefill_tool_calls_structured;
 
