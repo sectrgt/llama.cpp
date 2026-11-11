@@ -666,6 +666,7 @@ struct common_params {
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
+    bool return_prefill = false;   // return complete assistant messages including prefilled content
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;
@@ -708,6 +709,23 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    // bounded slot-save store (LRU eviction by mtime; a state file + its .logits sidecar are
+    // evicted together as one unit). Defaults are finite & sane; 0 means "unlimited" (only if set).
+    int32_t slot_save_max_count = 64;                                // max snapshots in slot_save_path (0 = unlimited)
+    int64_t slot_save_max_bytes = (int64_t) 32 * 1024 * 1024 * 1024; // 32 GiB cap (0 = unlimited)
+    // --- auto disk prompt/KV cache (opt-in, default OFF; see tools/server "auto disk cache") ---
+    // master switch for the transparent cross-process prompt/KV cache. Requires slot_save_path.
+    // When false the whole feature is inert: no startup dir scan, no index, no per-request hashing.
+    bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
+    int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
+    bool    slot_save_compact = true; // delete old prefix caches when saving extended prompts
+    // Minimum seconds between automatic disk flushes of a slot's KV on task completion. At the
+    // end of each generated response, if this many seconds have elapsed since the slot's KV was
+    // last persisted to disk, auto_save_slot_if_useful is called. This bounds data loss on a
+    // crash to at most one interval of work without forcing a multi-GB write on every response.
+    // 0 = flush on every task completion (no interval gating). -1 = disable periodic flush.
+    // Default: 1800 (30 min).
+    int32_t slot_save_flush_interval_sec = 1800;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
