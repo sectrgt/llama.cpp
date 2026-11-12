@@ -20,6 +20,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
+#include "auto-cache.hpp"
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
@@ -1106,6 +1107,14 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // --- auto disk prompt/KV cache (opt-in: --slot-save-auto) ---
+    auto_cache_index auto_idx;
+    model_fp         cur_fp;
+
+    bool auto_cache_enabled() const {
+        return params_base.slot_save_auto && !params_base.slot_save_path.empty();
+    }
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1136,6 +1145,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // Flush auto disk cache before shutdown
+        if (auto_cache_enabled()) {
+            SRV_INF("%s", "flushing resident slot KV to disk on shutdown\n");
+            for (auto & slot : slots) {
+                auto_save_slot_if_useful(slot);
+            }
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1539,6 +1556,10 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // Auto-save KV to disk on slot release (auto disk cache)
+                if (auto_cache_enabled() && id_slot < (int)slots.size()) {
+                    auto_save_slot_if_useful(slots[id_slot]);
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1643,10 +1664,125 @@ private:
         return true;
     }
 
+    // --- auto disk cache: fingerprint, index, restore, save ---
+    // (all gated by auto_cache_enabled())
+
+    model_fp auto_compute_fingerprint() const {
+        model_fp fp{};
+        if (!model_tgt) return fp;
+
+        // hash model description
+        char desc[1024] = {};
+        
+        llama_model_desc(model_tgt, desc, sizeof(desc));
+        fp.fp_model = (uint64_t)std::hash<std::string>{}(std::string(desc));
+        fp.fp_n_vocab     = llama_vocab_n_tokens(vocab);
+        fp.fp_n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        fp.fp_n_embd      = llama_model_n_embd(model_tgt);
+        fp.fp_n_layer     = llama_model_n_layer(model_tgt);
+        fp.fp_rope_type   = llama_model_rope_type(model_tgt);
+        fp.fp_cache_k     = (uint32_t)params_base.cache_type_k;
+        fp.fp_cache_v     = (uint32_t)params_base.cache_type_v;
+        fp.fp_n_ctx       = (uint32_t)n_ctx_slot();
+        fp.fp_kv_full     = 0; // simplified for now
+        fp.fp_block       = (uint32_t)params_base.slot_save_block;
+        fp.fp_rope_scale  = 0; // bit-pattern of rope_freq_scale
+        fp.fp_rope_base   = 0;
+        fp.fp_yarn_ext    = 0;
+        fp.fp_yarn_attn   = 0;
+        fp.fp_yarn_beta_fast = 0;
+        fp.fp_yarn_beta_slow = 0;
+        fp.fp_yarn_orig_ctx   = 0;
+        fp.fp_lora        = 0;
+        fp.fp_mmproj_hash = 0;
+
+        return fp;
+    }
+
+    void auto_save_slot_if_useful(server_slot & slot) {
+        if (!auto_cache_enabled()) {
+            return;
+        }
+        const auto & wtask = slot.task ? slot.task : slot.task_prev;
+        if (!wtask || !wtask->need_sampling()) {
+            return;
+        }
+        const llama_tokens toks = slot.prompt.tokens.get_tokens();
+        if ((int) toks.size() < params_base.slot_save_block) {
+            return;
+        }
+        // Compute block hashes for the token prefix
+        const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model, {});
+        if (bhs.empty()) {
+            return;
+        }
+        const uint64_t full_hash = bhs.back();
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto it = auto_idx.by_boundary.find(full_hash);
+            if (it != auto_idx.by_boundary.end() && it->second.n_tokens >= (uint32_t)toks.size()) {
+                return; // already cached
+            }
+        }
+        // Save to disk using existing save infrastructure
+        char hash_str[32];
+        snprintf(hash_str, sizeof(hash_str), "%016lx", (unsigned long)full_hash);
+        const std::string fname = params_base.slot_save_path + "/auto_" + hash_str + "_" + std::to_string(toks.size()) + ".bin";
+        const std::string tmp = fname + ".tmp";
+        size_t n_written = 0;
+        if (save_slot_checkpoints(tmp, slot, n_written) && save_slot_draft(tmp, slot, n_written)) {
+            std::filesystem::rename(tmp, fname);
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_cache_entry e{ fname, (uint32_t)toks.size(), cur_fp };
+            for (auto bh : bhs) {
+                auto_idx.by_boundary[bh] = e;
+            }
+            SRV_INF("auto disk cache: saved snapshot %s (%zu tokens)\n", fname.c_str(), toks.size());
+        } else {
+            std::filesystem::remove(tmp);
+        }
+    }
+
+    void auto_index_scan() {
+        if (!auto_cache_enabled()) return;
+        std::lock_guard<std::mutex> lk(auto_idx.mtx);
+        if (auto_idx.scanned) return;
+        auto_idx.scanned = true;
+        const std::string dir = params_base.slot_save_path;
+        if (!std::filesystem::exists(dir)) return;
+        for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+            const std::string path = entry.path().string();
+            if (path.find(".tmp") != std::string::npos) continue;
+            if (path.find(".meta") != std::string::npos) continue;
+            if (path.find(".logits") != std::string::npos) continue;
+            if (path.find("auto_") == std::string::npos) continue;
+            // Index the file (simplified: no .meta sidecar parsing yet)
+            auto_cache_entry e;
+            e.state_path = path;
+            // Parse token count from filename: auto_<hash>_<count>.bin
+            auto pos = path.rfind(".bin");
+            if (pos != std::string::npos) {
+                auto pos2 = path.rfind("_");
+                if (pos2 != std::string::npos) {
+                    e.n_tokens = (uint32_t)std::stoul(path.substr(pos2 + 1, pos - pos2 - 1));
+                }
+            }
+            e.fp = cur_fp;
+            auto_idx.indexed_files.insert(path);
+            SRV_INF("auto disk cache: indexed %s (%u tokens)\n", path.c_str(), e.n_tokens);
+        }
+    }
+
     // unlike load_model(), this is only called once during initialization
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
         GGML_ASSERT(model_tgt != nullptr);
+
+        // Compute model fingerprint for auto disk cache (only if enabled)
+        if (auto_cache_enabled()) {
+            cur_fp = auto_compute_fingerprint();
+            auto_index_scan();
+        }
 
         GGML_ASSERT(!sleeping);
 
