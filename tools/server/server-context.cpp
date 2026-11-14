@@ -1557,13 +1557,11 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 // Auto-save KV to disk on slot release (auto disk cache)
-                // Guard: skip if slot is already in an error/idle state to prevent
-                // re-entrant calls during exception-triggered release.
+                // Note: release() calls reset() before this callback, which clears
+                // slot.task. But reset() saves the task to slot.task_prev first,
+                // so auto_save_slot_if_useful can still use task_prev.
                 if (auto_cache_enabled() && id_slot < (int)slots.size()) {
-                    auto & slot = slots[id_slot];
-                    if (slot.task && slot.task->need_sampling()) {
-                        auto_save_slot_if_useful(slot);
-                    }
+                    auto_save_slot_if_useful(slots[id_slot]);
                 }
                 queue_tasks.pop_deferred_task(id_slot);
             };
