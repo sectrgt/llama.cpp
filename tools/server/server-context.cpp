@@ -1557,8 +1557,13 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 // Auto-save KV to disk on slot release (auto disk cache)
+                // Guard: skip if slot is already in an error/idle state to prevent
+                // re-entrant calls during exception-triggered release.
                 if (auto_cache_enabled() && id_slot < (int)slots.size()) {
-                    auto_save_slot_if_useful(slots[id_slot]);
+                    auto & slot = slots[id_slot];
+                    if (slot.task && slot.task->need_sampling()) {
+                        auto_save_slot_if_useful(slot);
+                    }
                 }
                 queue_tasks.pop_deferred_task(id_slot);
             };
@@ -1724,23 +1729,53 @@ private:
                 return; // already cached
             }
         }
-        // Save to disk using existing save infrastructure
+        // Save to disk: write base KV state first, then append optional sections
         char hash_str[32];
         snprintf(hash_str, sizeof(hash_str), "%016lx", (unsigned long)full_hash);
         const std::string fname = params_base.slot_save_path + "/auto_" + hash_str + "_" + std::to_string(toks.size()) + ".bin";
         const std::string tmp = fname + ".tmp";
+
+        // 1. Write the base target-model KV/slot state (creates the .tmp file)
+        const auto packed = slot.prompt.tokens.serialize();
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx_tgt, tmp.c_str(), slot.id,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            SLT_WRN(slot, "auto disk cache: failed to write KV state to %s\n", tmp.c_str());
+            std::error_code ec_rm;
+            std::filesystem::remove(tmp, ec_rm);
+            return;
+        }
+
+        // 2. Append optional checkpoint and draft sections
         size_t n_written = 0;
-        if (save_slot_checkpoints(tmp, slot, n_written) && save_slot_draft(tmp, slot, n_written)) {
-            std::filesystem::rename(tmp, fname);
+        bool append_ok = save_slot_checkpoints(tmp, slot, n_written) && save_slot_draft(tmp, slot, n_written);
+        if (!append_ok) {
+            SLT_WRN(slot, "auto disk cache: appendix write failed for %s\n", tmp.c_str());
+            std::error_code ec_rm;
+            std::filesystem::remove(tmp, ec_rm);
+            return;
+        }
+
+        // 3. Atomically publish via rename (error-code variant, no throw)
+        std::error_code ec;
+        std::filesystem::rename(tmp, fname, ec);
+        if (ec) {
+            SLT_WRN(slot, "auto disk cache: rename failed: %s\n", ec.message().c_str());
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+
+        // 4. Update in-memory index only after successful publish
+        {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto_cache_entry e{ fname, (uint32_t)toks.size(), cur_fp };
             for (auto bh : bhs) {
                 auto_idx.by_boundary[bh] = e;
             }
-            SRV_INF("auto disk cache: saved snapshot %s (%zu tokens)\n", fname.c_str(), toks.size());
-        } else {
-            std::filesystem::remove(tmp);
+            auto_idx.indexed_files.insert(fname);
         }
+        SRV_INF("auto disk cache: saved snapshot %s (%zu tokens)\n", fname.c_str(), toks.size());
     }
 
     void auto_index_scan() {
@@ -1769,6 +1804,24 @@ private:
             }
             e.fp = cur_fp;
             auto_idx.indexed_files.insert(path);
+            // Populate by_boundary so cache lookups work after restart.
+            // The filename hash is the boundary hash for the full token prefix.
+            // Parse the hex hash from the filename: auto_<hex_hash>_<count>.bin
+            auto hash_start = path.rfind("auto_");
+            if (hash_start != std::string::npos) {
+                hash_start += 5; // skip "auto_"
+                auto hash_end = path.rfind("_");
+                if (hash_end != std::string::npos && hash_end > hash_start) {
+                    std::string hash_hex = path.substr(hash_start, hash_end - hash_start);
+                    uint64_t boundary_hash = 0;
+                    try {
+                        boundary_hash = std::stoull(hash_hex, nullptr, 16);
+                        auto_idx.by_boundary[boundary_hash] = e;
+                    } catch (...) {
+                        SRV_WRN("auto disk cache: could not parse hash from %s\n", path.c_str());
+                    }
+                }
+            }
             SRV_INF("auto disk cache: indexed %s (%u tokens)\n", path.c_str(), e.n_tokens);
         }
     }
