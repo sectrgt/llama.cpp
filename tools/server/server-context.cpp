@@ -31,6 +31,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <optional>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -338,6 +339,12 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+
+    // auto-restore: set when KV loaded from disk cache
+    bool just_restored = false;
+    std::vector<float> logits_last;      // stale logits capture (invalidated on restore)
+    int     logits_last_n_tokens = -1;
+    std::vector<float> restored_logits; // regenerate fast-path (FULL models)
 
     server_prompt prompt;
 
@@ -1764,6 +1771,14 @@ private:
             return;
         }
 
+        // 3b. Write .meta sidecar (tokens + fingerprint + media hashes) for restore lookups
+        const auto media_hashes = auto_media_hashes(slot.prompt.tokens);
+        const auto save_bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model, media_hashes);
+        const uint64_t chain_hash = save_bhs.empty() ? 0 : save_bhs.back();
+        if (!slot_meta_write(fname, cur_fp, toks, chain_hash, media_hashes)) {
+            SLT_WRN(slot, "auto disk cache: failed to write .meta sidecar for %s\n", fname.c_str());
+        }
+
         // 4. Update in-memory index only after successful publish
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -1776,52 +1791,195 @@ private:
         SRV_INF("auto disk cache: saved snapshot %s (%zu tokens)\n", fname.c_str(), toks.size());
     }
 
+    // === AUTO-RESTORE: lookup, do_slot_restore, and auto_restore_into_slot ===
+
+    // Refresh the index for cross-process visibility (throttled dir-mtime check).
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_refresh_locked(bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force &&
+            now - auto_idx.last_refresh < std::chrono::milliseconds(AUTO_REFRESH_MIN_MS)) {
+            return;
+        }
+        auto_idx.last_refresh = now;
+        std::error_code ec;
+        const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, ec);
+        if (!ec && dmt == auto_idx.dir_mtime && !force) {
+            return;
+        }
+        // dir changed (or forced): re-scan for new files, then reconcile deletions
+        auto_index_scan_locked();
+        auto_index_drop_missing_locked();
+    }
+
+    // Drop index entries pointing at files that no longer exist.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_drop_missing_locked() {
+        std::unordered_set<std::string> gone;
+        for (auto it = auto_idx.by_boundary.begin(); it != auto_idx.by_boundary.end(); ) {
+            std::error_code ec;
+            if (!std::filesystem::exists(it->second.state_path, ec) || ec) {
+                gone.insert(it->second.state_path);
+                it = auto_idx.by_boundary.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const auto & p : gone) {
+            auto_idx.indexed_files.erase(p);
+        }
+    }
+
+    // Insert a boundary->entry mapping, keeping the longest-prefix-wins invariant.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_insert_locked(uint64_t boundary, const auto_cache_entry & e) {
+        auto it = auto_idx.by_boundary.find(boundary);
+        if (it == auto_idx.by_boundary.end() || e.n_tokens > it->second.n_tokens) {
+            auto_idx.by_boundary[boundary] = e;
+        }
+    }
+
+    // Locked version of auto_index_scan that reads .meta sidecars for full indexing.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_scan_locked() {
+        SRV_INF("auto cache: scanning directory %s\n", params_base.slot_save_path.c_str());
+        std::error_code mec;
+        const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
+        if (!mec) { auto_idx.dir_mtime = dmt; }
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) { continue; }
+            const std::string p = it->path().string();
+            // skip .meta, .stokens, .logits, .tmp files
+            if (p.find(".meta") != std::string::npos) continue;
+            if (p.find(".stokens") != std::string::npos) continue;
+            if (p.find(".logits") != std::string::npos) continue;
+            if (p.find(".tmp") != std::string::npos) continue;
+            if (p.find("auto_") == std::string::npos) continue;
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) continue;
+            // already indexed?
+            if (auto_idx.indexed_files.count(p)) { continue; }
+            // read .meta sidecar for fingerprint + tokens
+            model_fp fp;
+            llama_tokens toks;
+            std::map<size_t, uint64_t> media_hashes;
+            if (!slot_meta_read(p, fp, toks, media_hashes)) {
+                SRV_INF("auto cache: skipping %s - no/corrupt .meta\n", p.c_str());
+                continue;
+            }
+            if (!(fp == cur_fp)) {
+                SRV_INF("auto cache: skipping %s - fingerprint mismatch\n", p.c_str());
+                continue;
+            }
+            const auto bhs = auto_block_hashes(toks, params_base.slot_save_block, cur_fp.fp_model, media_hashes);
+            auto_cache_entry e{ p, (uint32_t) toks.size(), fp };
+            for (uint64_t bh : bhs) {
+                auto_index_insert_locked(bh, e);
+            }
+            auto_idx.indexed_files.insert(p);
+            SRV_INF("auto cache: indexed %s (%u tokens)\n", p.c_str(), e.n_tokens);
+        }
+    }
+
+    // Longest-prefix lookup over request tokens. Returns the candidate whose boundary hash
+    // is the deepest match with a fingerprint equal to the live one.
+    std::optional<auto_cache_entry> auto_index_lookup(const server_tokens & req_tokens) {
+        if (!auto_cache_enabled()) { return std::nullopt; }
+        const auto media_hashes = auto_media_hashes(req_tokens);
+        const auto bhs = auto_block_hashes(req_tokens.get_tokens(), params_base.slot_save_block, cur_fp.fp_model, media_hashes);
+        std::lock_guard<std::mutex> lk(auto_idx.mtx);
+        auto_index_refresh_locked(false);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            for (size_t k = bhs.size(); k-- > 0; ) {
+                auto it = auto_idx.by_boundary.find(bhs[k]);
+                if (it == auto_idx.by_boundary.end()) { continue; }
+                if (!(it->second.fp == cur_fp)) { continue; }
+                return it->second;
+            }
+            if (attempt == 0) {
+                auto_index_refresh_locked(true); // miss -> rescan once
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Load a slot's KV state from a .bin file on disk.
+    bool do_slot_restore(server_slot & slot, const std::string & filepath) {
+        llama_tokens tokens;
+        tokens.resize(slot.n_ctx);
+        size_t token_count = 0;
+        const size_t nread = llama_state_seq_load_file(
+            ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+        if (nread == 0) {
+            slot.prompt.tokens.clear();
+            return false;
+        }
+        tokens.resize(token_count);
+        SLT_INF(slot, "do_slot_restore: loaded %zu tokens from %s\n", token_count, filepath.c_str());
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(tokens);
+        slot.just_restored = true;
+        slot.logits_last.clear();
+        slot.logits_last_n_tokens = -1;
+        return true;
+    }
+
+    // AUTO-RESTORE wrapper: byte-verify candidate tokens + fingerprint, then restore.
+    // Returns verified prefix length restored, or 0 if nothing restored.
+    int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
+                               const server_tokens & req_tokens, int n_keep_mem) {
+        model_fp disk_fp;
+        llama_tokens disk_toks;
+        std::map<size_t, uint64_t> disk_media;
+        if (!slot_meta_read(cand.state_path, disk_fp, disk_toks, disk_media)) {
+            return 0;
+        }
+        if (!(disk_fp == cur_fp)) {
+            return 0;
+        }
+        const llama_tokens & req = req_tokens.get_tokens();
+        const auto req_media = auto_media_hashes(req_tokens);
+        // byte-verify: longest common prefix of persisted tokens and request
+        const size_t lim = std::min(disk_toks.size(), req.size());
+        size_t v = 0;
+        while (v < lim) {
+            if (disk_toks[v] != req[v]) { break; }
+            ++v;
+        }
+        SLT_INF(slot, "auto-restore: disk_toks=%zu req=%zu common_prefix=%zu\n",
+                disk_toks.size(), req.size(), v);
+        const int B = params_base.slot_save_block;
+        int n_keep_disk;
+        if (v == disk_toks.size()) {
+            n_keep_disk = (int) disk_toks.size();
+        } else {
+            n_keep_disk = (int) (v - (v % (size_t) B));
+        }
+        if (n_keep_disk <= 0) { return 0; }
+        // MARGIN gate: only load from disk if it beats in-memory by at least one block
+        if (n_keep_disk < n_keep_mem + B) {
+            return 0;
+        }
+        // Clear slot KV before loading
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+        slot.prompt.tokens.clear();
+        if (!do_slot_restore(slot, cand.state_path)) {
+            return 0;
+        }
+        auto_touch_unit(cand.state_path);
+        SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory was %d), file=%s\n",
+                n_keep_disk, n_keep_mem, cand.state_path.c_str());
+        return n_keep_disk;
+    }
+
     void auto_index_scan() {
         if (!auto_cache_enabled()) return;
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
         if (auto_idx.scanned) return;
         auto_idx.scanned = true;
-        const std::string dir = params_base.slot_save_path;
-        if (!std::filesystem::exists(dir)) return;
-        for (const auto & entry : std::filesystem::directory_iterator(dir)) {
-            const std::string path = entry.path().string();
-            if (path.find(".tmp") != std::string::npos) continue;
-            if (path.find(".meta") != std::string::npos) continue;
-            if (path.find(".logits") != std::string::npos) continue;
-            if (path.find("auto_") == std::string::npos) continue;
-            // Index the file (simplified: no .meta sidecar parsing yet)
-            auto_cache_entry e;
-            e.state_path = path;
-            // Parse token count from filename: auto_<hash>_<count>.bin
-            auto pos = path.rfind(".bin");
-            if (pos != std::string::npos) {
-                auto pos2 = path.rfind("_");
-                if (pos2 != std::string::npos) {
-                    e.n_tokens = (uint32_t)std::stoul(path.substr(pos2 + 1, pos - pos2 - 1));
-                }
-            }
-            e.fp = cur_fp;
-            auto_idx.indexed_files.insert(path);
-            // Populate by_boundary so cache lookups work after restart.
-            // The filename hash is the boundary hash for the full token prefix.
-            // Parse the hex hash from the filename: auto_<hex_hash>_<count>.bin
-            auto hash_start = path.rfind("auto_");
-            if (hash_start != std::string::npos) {
-                hash_start += 5; // skip "auto_"
-                auto hash_end = path.rfind("_");
-                if (hash_end != std::string::npos && hash_end > hash_start) {
-                    std::string hash_hex = path.substr(hash_start, hash_end - hash_start);
-                    uint64_t boundary_hash = 0;
-                    try {
-                        boundary_hash = std::stoull(hash_hex, nullptr, 16);
-                        auto_idx.by_boundary[boundary_hash] = e;
-                    } catch (...) {
-                        SRV_WRN("auto disk cache: could not parse hash from %s\n", path.c_str());
-                    }
-                }
-            }
-            SRV_INF("auto disk cache: indexed %s (%u tokens)\n", path.c_str(), e.n_tokens);
-        }
+        auto_index_scan_locked();
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -4301,6 +4459,22 @@ private:
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // ===== AUTO-RESTORE: cold/cross-process KV reuse from disk =====
+                                // If the in-memory match (n_past) is poor and the disk index holds a
+                                // snapshot whose persisted tokens are a verified, fingerprint-matching,
+                                // longer prefix of this request, restore it INTO the slot and recompute
+                                // n_past so downstream machinery runs unchanged.
+                                if (auto_cache_enabled()
+                                        && slot.task->need_sampling()
+                                        && slot.alora_invocation_start <= 0) {
+                                    if (auto cand = auto_index_lookup(input_tokens)) {
+                                        auto_restore_into_slot(slot, *cand, input_tokens, (int) n_past);
+                                        // recompute n_past after restore attempt (success or failure)
+                                        n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                        SLT_INF(slot, "auto-restore: n_past after restore = %d\n", (int) n_past);
+                                    }
+                                }
 
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {

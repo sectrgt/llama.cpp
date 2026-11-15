@@ -268,3 +268,82 @@ static bool slot_meta_write(const std::string & state_filepath,
     return true;
 }
 
+// Read the .meta sidecar (tokens + fingerprint + media hashes).
+// Returns true on success, false on any error/corruption.
+static bool slot_meta_read(const std::string & state_filepath,
+                           model_fp & fp_out,
+                           llama_tokens & toks_out,
+                           std::map<size_t, uint64_t> & media_hashes_out) {
+    fp_out = model_fp{};
+    toks_out.clear();
+    media_hashes_out.clear();
+    const std::string sidecar = slot_meta_sidecar_path(state_filepath);
+    std::ifstream f(sidecar, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    auto get_u32 = [&](uint32_t & v) -> bool {
+        unsigned char b[4];
+        f.read((char *) b, 4);
+        if (f.gcount() != 4) { return false; }
+        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    auto get_u64 = [&](uint64_t & v) -> bool {
+        uint32_t lo = 0, hi = 0;
+        if (!get_u32(lo) || !get_u32(hi)) { return false; }
+        v = (uint64_t) lo | ((uint64_t) hi << 32);
+        return true;
+    };
+    uint32_t magic = 0, version = 0;
+    if (!get_u32(magic) || !get_u32(version)) { return false; }
+    if (magic != SLOT_META_MAGIC || version != SLOT_META_VERSION) { return false; }
+    model_fp fp;
+    uint32_t tok_count = 0;
+    uint64_t chain_hash = 0;
+    if (!get_u64(fp.fp_model)         || !get_u32(fp.fp_n_vocab)       || !get_u32(fp.fp_n_ctx_train) ||
+        !get_u32(fp.fp_n_embd)        || !get_u32(fp.fp_n_layer)       || !get_u32(fp.fp_rope_type)   ||
+        !get_u32(fp.fp_cache_k)       || !get_u32(fp.fp_cache_v)       || !get_u32(fp.fp_n_ctx)       ||
+        !get_u32(fp.fp_kv_full)       || !get_u32(fp.fp_block)         || !get_u64(fp.fp_rope_scale)  ||
+        !get_u64(fp.fp_rope_base)     || !get_u32(fp.fp_yarn_ext)      || !get_u32(fp.fp_yarn_attn)   ||
+        !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
+        !get_u64(fp.fp_lora)          || !get_u64(fp.fp_mmproj_hash)   ||
+        !get_u32(tok_count)           || !get_u64(chain_hash)) {
+        return false;
+    }
+    (void) chain_hash;
+    if (tok_count > (1u << 28)) { return false; } // sanity-bound
+    toks_out.resize(tok_count);
+    const std::streamsize want = (std::streamsize) tok_count * (std::streamsize) sizeof(int32_t);
+    f.read((char *) toks_out.data(), want);
+    if (f.gcount() != want) {
+        toks_out.clear();
+        return false;
+    }
+    // media chunk content hashes (optional, may be absent for text-only snapshots)
+    uint32_t n_media = 0;
+    if (!get_u32(n_media)) {
+        fp_out = fp;
+        return true; // truncated v2 sidecar = no media hashes = text-only
+    }
+    if (n_media > (1u << 24)) { toks_out.clear(); return false; }
+    for (uint32_t i = 0; i < n_media; ++i) {
+        uint64_t idx = 0, hash = 0;
+        if (!get_u64(idx) || !get_u64(hash)) {
+            toks_out.clear();
+            media_hashes_out.clear();
+            return false;
+        }
+        media_hashes_out[(size_t) idx] = hash;
+    }
+    fp_out = fp;
+    return true;
+}
+
+// Touch the .meta/.logits sidecars' mtime to mark a cache as recently-used (LRU).
+static void auto_touch_unit(const std::string & state_filepath) {
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::error_code ec;
+    std::filesystem::last_write_time(state_filepath, now, ec);
+    std::filesystem::last_write_time(slot_meta_sidecar_path(state_filepath), now, ec);
+}
