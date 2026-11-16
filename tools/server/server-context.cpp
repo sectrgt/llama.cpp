@@ -1741,10 +1741,12 @@ private:
         const std::string tmp = fname + ".tmp";
 
         // 1. Write the base target-model KV/slot state (creates the .tmp file)
-        const auto packed = slot.prompt.tokens.serialize();
+        // Use raw tokens (toks = get_tokens()) NOT serialize() — serialize() packs a header
+        // and media chunk state into the token stream, which corrupts the token
+        // array when loaded back as raw llama_tokens by do_slot_restore.
         const size_t nwrite = llama_state_seq_save_file(
             ctx_tgt, tmp.c_str(), slot.id,
-            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+            toks.data(), toks.size());
         if (nwrite == 0) {
             SLT_WRN(slot, "auto disk cache: failed to write KV state to %s\n", tmp.c_str());
             std::error_code ec_rm;
