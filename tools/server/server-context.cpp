@@ -4471,6 +4471,12 @@ private:
                                     if (auto cand = auto_index_lookup(input_tokens)) {
                                         auto_restore_into_slot(slot, *cand, input_tokens, (int) n_past);
                                         // recompute n_past after restore attempt (success or failure)
+                                        SLT_INF(slot, "auto-restore debug: slot.prompt.tokens.size()=%zu input_tokens.size()=%zu has_mtmd=%d\n",
+                                                slot.prompt.tokens.size(), input_tokens.size(), (int) input_tokens.has_mtmd);
+                                        if (slot.prompt.tokens.size() > 0 && input_tokens.size() > 0) {
+                                            SLT_INF(slot, "auto-restore debug: slot.prompt.tokens[0]=%d input_tokens[0]=%d\n",
+                                                    (int) slot.prompt.tokens[0], (int) input_tokens[0]);
+                                        }
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         SLT_INF(slot, "auto-restore: n_past after restore = %d\n", (int) n_past);
                                     }
