@@ -346,6 +346,10 @@ struct server_slot {
     int     logits_last_n_tokens = -1;
     std::vector<float> restored_logits; // regenerate fast-path (FULL models)
 
+    // Timestamp (ggml_time_us) of the last time this slot's KV was persisted to disk.
+    // -1 = never. Used by the periodic flush (slot_save_flush_interval_sec).
+    int64_t last_disk_save_time = -1;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -1563,12 +1567,22 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                // Auto-save KV to disk on slot release (auto disk cache)
-                // Note: release() calls reset() before this callback, which clears
-                // slot.task. But reset() saves the task to slot.task_prev first,
-                // so auto_save_slot_if_useful can still use task_prev.
+                // Auto-save KV to disk on slot release, gated by flush interval.
+                // The interval prevents writing a multi-GB state on every response when
+                // the KV hasn't changed meaningfully. -1 = disable periodic flush.
                 if (auto_cache_enabled() && id_slot < (int)slots.size()) {
-                    auto_save_slot_if_useful(slots[id_slot]);
+                    server_slot * s = get_slot_by_id(id_slot);
+                    if (s) {
+                        const int64_t now = ggml_time_us();
+                        const int64_t interval_sec = params_base.slot_save_flush_interval_sec == -1
+                            ? INT32_MAX : params_base.slot_save_flush_interval_sec;
+                        const int64_t interval_us = interval_sec * 1000000;
+                        if (params_base.slot_save_flush_interval_sec == 0 ||
+                            s->last_disk_save_time < 0 ||
+                            now - s->last_disk_save_time >= interval_us) {
+                            auto_save_slot_if_useful(*s);
+                        }
+                    }
                 }
                 queue_tasks.pop_deferred_task(id_slot);
             };
@@ -1816,6 +1830,13 @@ private:
                 auto_idx.by_boundary[bh] = e;
             }
             auto_idx.indexed_files.insert(fname);
+        }
+        // stamp the flush timer: the slot's KV is now on disk.
+        slot.last_disk_save_time = ggml_time_us();
+        // Compact old prefix caches AFTER new cache is safely on disk.
+        if (params_base.slot_save_compact) {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_compact_after_save_locked(fname, toks, bhs);
         }
         SRV_INF("auto disk cache: saved snapshot %s (%zu tokens)\n", fname.c_str(), toks.size());
     }
@@ -2082,6 +2103,52 @@ private:
         SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory was %d), file=%s\n",
                 n_keep_disk, n_keep_mem, cand.state_path.c_str());
         return n_keep_disk;
+    }
+
+    // Compact: delete old prefix snapshots superseded by a newer longer one.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_compact_after_save_locked(const std::string & new_path, const llama_tokens & toks,
+                                               const std::vector<uint64_t> & bhs) {
+        if (!params_base.slot_save_compact || bhs.empty()) return;
+        std::vector<std::tuple<std::string, llama_tokens, std::map<size_t, uint64_t>>> all_caches;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec) || ec) continue;
+            const std::string p = it->path().string();
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) continue;
+            if (p == new_path) continue; // skip the newly saved file
+            const std::string pbase = it->path().filename().string();
+            if (pbase.rfind("auto_", 0) != 0) continue; // only compact auto-saved caches
+            model_fp fp;
+            llama_tokens meta_toks;
+            std::map<size_t, uint64_t> meta_media;
+            if (!slot_meta_read(p, fp, meta_toks, meta_media)) continue;
+            if (!(fp == cur_fp)) continue;
+            all_caches.push_back({p, std::move(meta_toks), std::move(meta_media)});
+        }
+        std::unordered_set<std::string> to_delete;
+        for (const auto & [path, meta_toks, meta_media] : all_caches) {
+            if (meta_toks.size() >= toks.size()) continue;
+            const auto short_bhs = auto_block_hashes(meta_toks, params_base.slot_save_block, cur_fp.fp_model, meta_media);
+            bool is_prefix = true;
+            for (size_t i = 0; i < short_bhs.size(); i++) {
+                if (i >= bhs.size() || short_bhs[i] != bhs[i]) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if (is_prefix) to_delete.insert(path);
+        }
+        for (const auto & path : to_delete) {
+            SRV_INF("auto cache: compacting %s\n", path.c_str());
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(slot_meta_sidecar_path(path), ec);
+            std::filesystem::remove(slot_logits_sidecar_path(path), ec);
+            std::filesystem::remove((path + ".stokens"), ec);
+            auto_idx.indexed_files.erase(path);
+        }
     }
 
     void auto_index_scan() {
@@ -4803,6 +4870,91 @@ private:
                                     }
                                 }
                             }
+                        }
+
+                        // ===== restore-continue (regenerate fast-path) ==============================
+                        // A just-restored FULL/recurrent slot receiving the EXACT restored tokens (no
+                        // suffix) cannot rewind its memory: the normal path would re-decode into the
+                        // already-occupied sequence and crash. Detect that case here, BEFORE the
+                        // n_past>0 guard, and either emit the first token from saved logits (fast path)
+                        // or fall back to a safe clear-then-reprefill (never crash).
+                        // Gated so it is unreachable for non-recurrent models, with-suffix requests,
+                        // non-generative slots, and multimodal.
+                        if (slot.just_restored &&
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                            slot.task->need_sampling() &&
+                            slot.alora_invocation_start <= 0 &&
+                            n_past == slot.task->n_tokens() &&
+                            n_past == (int) slot.prompt.n_tokens()) {
+
+                            slot.just_restored = false; // one-shot consume
+
+                            if (!slot.restored_logits.empty()) {
+                                // --- fast path: emit first token from saved logits, no decode ---
+                                slot.stats.n_prompt_cached    = n_past;
+                                slot.stats.n_prompt_processed = 0;
+
+                                slot.n_decoded = 0;
+                                slot.init_sampler();
+
+                                slot.state   = SLOT_STATE_GENERATING;
+                                slot.i_batch = -1;
+
+                                if (slot.can_speculate()) {
+                                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                                }
+
+                                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                                const llama_token id = common_sampler_sample_from_logits(
+                                        slot.smpl.get(), slot.restored_logits.data(), nv, /*grammar_first=*/false);
+                                slot.restored_logits.clear();
+
+                                common_sampler_accept(slot.smpl.get(), id, true);
+
+                                const int64_t t_current = ggml_time_us();
+                                slot.n_decoded += 1;
+                                slot.t_start_generation  = t_current;
+                                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                                metrics.on_prompt_eval(slot);
+                                slot.t_token_generation  = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+                                if (slot.task->params.stream) {
+                                    if (slot.task->params.return_progress) {
+                                        send_partial_response(slot, {}, true);
+                                    } else {
+                                        send_partial_response(slot, {}, false, true);
+                                    }
+                                }
+
+                                completion_token_output result;
+                                result.tok  = id;
+                                const bool keep_special =
+                                    params_base.special ||
+                                    slot.task->params.sampling.preserved_tokens.find(result.tok) !=
+                                        slot.task->params.sampling.preserved_tokens.end();
+                                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, keep_special);
+                                result.prob         = 1.0f;
+
+                                if (slot.task->params.sampling.n_probs > 0 && slot.task->params.post_sampling_probs) {
+                                    populate_token_probs(slot, result, /*post_sampling=*/true, params_base.special, /*idx=*/-1);
+                                }
+
+                                if (!process_token(result, slot)) {
+                                    slot.print_timings();
+                                    send_final_response(slot);
+                                    metrics.on_prediction(slot);
+                                    slot.release();
+                                }
+
+                                SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n=0)\n");
+                                return; // skip prompt-batch building for this slot
+                            }
+
+                            // --- safe fallback: no saved logits -> clear restored seq, then reprefill ---
+                            SLT_WRN(slot, "%s", "restore-continue: no saved logits; clearing restored state and re-prefilling\n");
+                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                            slot.prompt.tokens.clear();
+                            n_past = 0;
                         }
 
                         // [TAG_PROMPT_LOGITS]
