@@ -15,6 +15,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <fstream>
 
 // Magic/version for .meta sidecar files
 static constexpr uint32_t SLOT_META_MAGIC   = 0x4D455441; // 'META'
@@ -346,4 +347,74 @@ static void auto_touch_unit(const std::string & state_filepath) {
     std::error_code ec;
     std::filesystem::last_write_time(state_filepath, now, ec);
     std::filesystem::last_write_time(slot_meta_sidecar_path(state_filepath), now, ec);
+    std::filesystem::last_write_time(slot_logits_sidecar_path(state_filepath), now, ec);
+}
+
+// --- KV restore-reuse: logits sidecar -------------------------------------------
+// Persist the last decoded token's full-vocab logits in a small sidecar file (<state>.logits).
+// On SLOT_RESTORE of an exact-prompt "regenerate" request, those logits let the server emit the
+// first token WITHOUT re-decoding into the restored recurrent state. Best-effort: any
+// missing/corrupt/vocab-mismatched sidecar degrades gracefully to the existing behavior.
+static constexpr uint32_t SLOT_LOGITS_MAGIC   = 0x474C4B4Cu; // "LKBG"
+static constexpr uint32_t SLOT_LOGITS_VERSION = 1u;
+
+static std::string slot_logits_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".logits";
+}
+
+static size_t slot_logits_write(const std::string & state_filepath,
+                                const std::vector<float> & logits,
+                                int32_t n_vocab, uint32_t n_tokens) {
+    if (logits.empty() || (int32_t) logits.size() != n_vocab || n_vocab <= 0) return 0;
+    const std::string sidecar = slot_logits_sidecar_path(state_filepath);
+    const std::string tmp     = sidecar + ".tmp";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return 0;
+    auto put_u32 = [&](uint32_t v) {
+        const unsigned char b[4] = {
+            (unsigned char)( v        & 0xFF),
+            (unsigned char)((v >> 8)  & 0xFF),
+            (unsigned char)((v >> 16) & 0xFF),
+            (unsigned char)((v >> 24) & 0xFF),
+        };
+        f.write((const char *) b, 4);
+    };
+    put_u32(SLOT_LOGITS_MAGIC);
+    put_u32(SLOT_LOGITS_VERSION);
+    put_u32((uint32_t) n_vocab);
+    put_u32(n_tokens);
+    f.write((const char *) logits.data(), (std::streamsize) logits.size() * sizeof(float));
+    f.flush();
+    if (!f.good()) { f.close(); std::error_code ec; std::filesystem::remove(tmp, ec); return 0; }
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, sidecar, ec);
+    if (ec) { std::filesystem::remove(tmp, ec); return 0; }
+    return 16 + logits.size() * sizeof(float);
+}
+
+static bool slot_logits_read(const std::string & state_filepath,
+                             int32_t expect_n_vocab, uint32_t expect_n_tokens,
+                             std::vector<float> & out) {
+    out.clear();
+    if (expect_n_vocab <= 0) return false;
+    const std::string sidecar = slot_logits_sidecar_path(state_filepath);
+    std::ifstream f(sidecar, std::ios::binary);
+    if (!f) return false;
+    auto get_u32 = [&](uint32_t & v) -> bool {
+        unsigned char b[4];
+        f.read((char *) b, 4);
+        if (f.gcount() != 4) return false;
+        v = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    uint32_t magic = 0, version = 0, n_vocab = 0, n_tokens = 0;
+    if (!get_u32(magic) || !get_u32(version) || !get_u32(n_vocab) || !get_u32(n_tokens)) return false;
+    if (magic != SLOT_LOGITS_MAGIC || version != SLOT_LOGITS_VERSION ||
+        (int32_t) n_vocab != expect_n_vocab || n_tokens != expect_n_tokens) return false;
+    out.resize(n_vocab);
+    const std::streamsize want = (std::streamsize) n_vocab * (std::streamsize) sizeof(float);
+    f.read((char *) out.data(), want);
+    if (f.gcount() != want) { out.clear(); return false; }
+    return true;
 }

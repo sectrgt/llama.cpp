@@ -1764,14 +1764,41 @@ private:
             return;
         }
 
+        // 2b. Write logits sidecar (FULL only, when captured logits belong to this exact state)
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            slot.logits_last_n_tokens == (int32_t) toks.size() && !slot.logits_last.empty()) {
+            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
+        }
+
+        // 2c. Write .stokens sidecar (media chunk data for multimodal restore)
+        {
+            auto stokens_data = slot.prompt.tokens.serialize();
+            if (!stokens_data.empty()) {
+                std::string stokens_tmp = tmp + ".stokens";
+                FILE * fp = fopen(stokens_tmp.c_str(), "wb");
+                if (fp) {
+                    fwrite(stokens_data.data(), 1, stokens_data.size(), fp);
+                    fclose(fp);
+                }
+            }
+        }
+
         // 3. Atomically publish via rename (error-code variant, no throw)
         std::error_code ec;
         std::filesystem::rename(tmp, fname, ec);
         if (ec) {
             SLT_WRN(slot, "auto disk cache: rename failed: %s\n", ec.message().c_str());
             std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(tmp + ".stokens", ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             return;
         }
+        // Rename sidecars to final names
+        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
+        ec.clear();
+        std::filesystem::rename(tmp + ".stokens", fname + ".stokens", ec);
+        ec.clear();
 
         // 3b. Write .meta sidecar (tokens + fingerprint + media hashes) for restore lookups
         const auto media_hashes = auto_media_hashes(slot.prompt.tokens);
@@ -1829,6 +1856,11 @@ private:
         }
         for (const auto & p : gone) {
             auto_idx.indexed_files.erase(p);
+            // Clean up all sidecar files for the deleted snapshot
+            std::error_code ec;
+            std::filesystem::remove(p + ".stokens", ec);
+            std::filesystem::remove(slot_logits_sidecar_path(p), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(p), ec);
         }
     }
 
@@ -1908,23 +1940,99 @@ private:
     }
 
     // Load a slot's KV state from a .bin file on disk.
-    bool do_slot_restore(server_slot & slot, const std::string & filepath) {
+    // out_token_count/out_nread are optional diagnostic outputs for the SLOT_RESTORE API path.
+    bool do_slot_restore(server_slot & slot, const std::string & filepath,
+                         size_t * out_token_count = nullptr, size_t * out_nread = nullptr) {
         llama_tokens tokens;
         tokens.resize(slot.n_ctx);
         size_t token_count = 0;
         const size_t nread = llama_state_seq_load_file(
             ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+        if (out_nread)       { *out_nread = nread; }
+        if (out_token_count) { *out_token_count = token_count; }
         if (nread == 0) {
             slot.prompt.tokens.clear();
             return false;
         }
         tokens.resize(token_count);
         SLT_INF(slot, "do_slot_restore: loaded %zu tokens from %s\n", token_count, filepath.c_str());
+
+        // tokens always come from .bin; chunk data (map_idx_to_media) comes from .stokens
         slot.prompt.tokens.clear();
         slot.prompt.tokens.insert(tokens);
+
+        // load .stokens sidecar (chunk data only; tokens already loaded from .bin)
+        {
+            std::string stokens_path = filepath + ".stokens";
+            FILE * fp_stokens = fopen(stokens_path.c_str(), "rb");
+            if (fp_stokens) {
+                fseek(fp_stokens, 0, SEEK_END);
+                long stokens_size = ftell(fp_stokens);
+                fseek(fp_stokens, 0, SEEK_SET);
+                if (stokens_size > 0) {
+                    std::vector<uint8_t> stokens_data(stokens_size);
+                    size_t nread_stokens = fread(stokens_data.data(), 1, stokens_size, fp_stokens);
+                    fclose(fp_stokens);
+                    // Use our deserialize: reconstruct media map from packed data
+                    llama_tokens packed(stokens_data.size() / sizeof(llama_token));
+                    memcpy(packed.data(), stokens_data.data(), stokens_data.size());
+                    bool has_mtmd = mctx != nullptr;
+                    try {
+                        slot.prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
+                        SLT_INF(slot, "do_slot_restore: loaded .stokens sidecar (%ld bytes)\n", stokens_size);
+                    } catch (...) {
+                        SLT_WRN(slot, "%s", "do_slot_restore: failed to load .stokens sidecar, clearing KV cache\n");
+                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                        slot.prompt.tokens.clear();
+                        return false;
+                    }
+                } else {
+                    fclose(fp_stokens);
+                }
+            }
+        }
+
+        // safety check: if tokens have NULLs (multimodal) but map_idx_to_media is empty,
+        // pos_next() would return wrong values, causing a crash. Clear and fall back.
+        if (slot.prompt.tokens.has_mtmd && slot.prompt.tokens.map_idx_to_media.empty()) {
+            bool has_null = false;
+            for (size_t i = 0; i < slot.prompt.tokens.size() && i < slot.prompt.tokens.size(); ++i) {
+                if (slot.prompt.tokens[i] == LLAMA_TOKEN_NULL) { has_null = true; break; }
+            }
+            if (has_null) {
+                SLT_WRN(slot, "%s", "do_slot_restore: tokens have NULLs but no chunk data, clearing KV cache\n");
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                slot.prompt.tokens.clear();
+                return false;
+            }
+        }
+
+        SLT_INF(slot, "do_slot_restore: slot.prompt.tokens.size() = %zu\n", slot.prompt.tokens.size());
         slot.just_restored = true;
+
+        // Reconstruct a context checkpoint at the restored position so hybrid/recurrent (and SWA)
+        // models — which cannot partially rewind — can reuse this state for the suffix.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+            const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (ckpt_pos_min >= 0) {
+                slot.prompt.checkpoints.clear();
+                create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
+            }
+        }
+
+        // The restored state's running distribution is unknown; invalidate any stale capture.
         slot.logits_last.clear();
         slot.logits_last_n_tokens = -1;
+
+        // Load the regenerate logits sidecar (FULL only) for exact-prompt regenerate fast-path.
+        slot.restored_logits.clear();
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            if (slot_logits_read(filepath, nv, (uint32_t) token_count, slot.restored_logits)) {
+                SLT_INF(slot, "loaded logits sidecar (%d vocab, %zu tokens) — regenerate fast-path armed\n", nv, token_count);
+            }
+        }
         return true;
     }
 
