@@ -2015,9 +2015,9 @@ private:
 
         // safety check: if tokens have NULLs (multimodal) but map_idx_to_media is empty,
         // pos_next() would return wrong values, causing a crash. Clear and fall back.
-        if (slot.prompt.tokens.has_mtmd && slot.prompt.tokens.map_idx_to_media.empty()) {
+        if (slot.prompt.tokens.has_mtmd) {
             bool has_null = false;
-            for (size_t i = 0; i < slot.prompt.tokens.size() && i < slot.prompt.tokens.size(); ++i) {
+            for (size_t i = 0; i < slot.prompt.tokens.size(); ++i) {
                 if (slot.prompt.tokens[i] == LLAMA_TOKEN_NULL) { has_null = true; break; }
             }
             if (has_null) {
@@ -4876,10 +4876,9 @@ private:
                         // A just-restored FULL/recurrent slot receiving the EXACT restored tokens (no
                         // suffix) cannot rewind its memory: the normal path would re-decode into the
                         // already-occupied sequence and crash. Detect that case here, BEFORE the
-                        // n_past>0 guard, and either emit the first token from saved logits (fast path)
-                        // or fall back to a safe clear-then-reprefill (never crash).
-                        // Gated so it is unreachable for non-recurrent models, with-suffix requests,
-                        // non-generative slots, and multimodal.
+                        // n_past>0 guard. For our current models (standard transformers, not FULL
+                        // seq_rm_type), this block is unreachable dead code — it exists as
+                        // future-proofing for recurrent/hybrid model architectures.
                         if (slot.just_restored &&
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                             slot.task->need_sampling() &&
@@ -4889,69 +4888,11 @@ private:
 
                             slot.just_restored = false; // one-shot consume
 
-                            if (!slot.restored_logits.empty()) {
-                                // --- fast path: emit first token from saved logits, no decode ---
-                                slot.stats.n_prompt_cached    = n_past;
-                                slot.stats.n_prompt_processed = 0;
-
-                                slot.n_decoded = 0;
-                                slot.init_sampler();
-
-                                slot.state   = SLOT_STATE_GENERATING;
-                                slot.i_batch = -1;
-
-                                if (slot.can_speculate()) {
-                                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
-                                }
-
-                                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-                                const llama_token id = common_sampler_sample_from_logits(
-                                        slot.smpl.get(), slot.restored_logits.data(), nv, /*grammar_first=*/false);
-                                slot.restored_logits.clear();
-
-                                common_sampler_accept(slot.smpl.get(), id, true);
-
-                                const int64_t t_current = ggml_time_us();
-                                slot.n_decoded += 1;
-                                slot.t_start_generation  = t_current;
-                                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                                metrics.on_prompt_eval(slot);
-                                slot.t_token_generation  = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
-
-                                if (slot.task->params.stream) {
-                                    if (slot.task->params.return_progress) {
-                                        send_partial_response(slot, {}, true);
-                                    } else {
-                                        send_partial_response(slot, {}, false, true);
-                                    }
-                                }
-
-                                completion_token_output result;
-                                result.tok  = id;
-                                const bool keep_special =
-                                    params_base.special ||
-                                    slot.task->params.sampling.preserved_tokens.find(result.tok) !=
-                                        slot.task->params.sampling.preserved_tokens.end();
-                                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, keep_special);
-                                result.prob         = 1.0f;
-
-                                if (slot.task->params.sampling.n_probs > 0 && slot.task->params.post_sampling_probs) {
-                                    populate_token_probs(slot, result, /*post_sampling=*/true, params_base.special, /*idx=*/-1);
-                                }
-
-                                if (!process_token(result, slot)) {
-                                    slot.print_timings();
-                                    send_final_response(slot);
-                                    metrics.on_prediction(slot);
-                                    slot.release();
-                                }
-
-                                SLT_INF(slot, "%s", "restore-continue: emitted first token from saved logits (prompt_n=0)\n");
-                                return; // skip prompt-batch building for this slot
-                            }
-
-                            // --- safe fallback: no saved logits -> clear restored seq, then reprefill ---
-                            SLT_WRN(slot, "%s", "restore-continue: no saved logits; clearing restored state and re-prefilling\n");
+                            // Safe fallback: clear restored KV sequence, then reprefill.
+                            // FULL models support full-sequence removal; clearing first guarantees
+                            // the subsequent reprefill writes into an EMPTY sequence instead of
+                            // re-decoding into the already-occupied restored state (which would crash).
+                            SLT_WRN(slot, "%s", "restore-continue: clearing restored state and re-prefilling\n");
                             llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
                             slot.prompt.tokens.clear();
                             n_past = 0;

@@ -341,6 +341,16 @@ static bool slot_meta_read(const std::string & state_filepath,
     return true;
 }
 
+// --- KV restore-reuse: logits sidecar -------------------------------------------
+// Persist the last decoded token's full-vocab logits in a small sidecar file (<state>.logits).
+// Best-effort: any missing/corrupt/vocab-mismatched sidecar degrades gracefully.
+static constexpr uint32_t SLOT_LOGITS_MAGIC   = 0x474C4B4Cu; // "LKBG"
+static constexpr uint32_t SLOT_LOGITS_VERSION = 1u;
+
+static std::string slot_logits_sidecar_path(const std::string & state_filepath) {
+    return state_filepath + ".logits";
+}
+
 // Touch the .meta/.logits sidecars' mtime to mark a cache as recently-used (LRU).
 static void auto_touch_unit(const std::string & state_filepath) {
     const auto now = std::filesystem::file_time_type::clock::now();
@@ -348,18 +358,6 @@ static void auto_touch_unit(const std::string & state_filepath) {
     std::filesystem::last_write_time(state_filepath, now, ec);
     std::filesystem::last_write_time(slot_meta_sidecar_path(state_filepath), now, ec);
     std::filesystem::last_write_time(slot_logits_sidecar_path(state_filepath), now, ec);
-}
-
-// --- KV restore-reuse: logits sidecar -------------------------------------------
-// Persist the last decoded token's full-vocab logits in a small sidecar file (<state>.logits).
-// On SLOT_RESTORE of an exact-prompt "regenerate" request, those logits let the server emit the
-// first token WITHOUT re-decoding into the restored recurrent state. Best-effort: any
-// missing/corrupt/vocab-mismatched sidecar degrades gracefully to the existing behavior.
-static constexpr uint32_t SLOT_LOGITS_MAGIC   = 0x474C4B4Cu; // "LKBG"
-static constexpr uint32_t SLOT_LOGITS_VERSION = 1u;
-
-static std::string slot_logits_sidecar_path(const std::string & state_filepath) {
-    return state_filepath + ".logits";
 }
 
 static size_t slot_logits_write(const std::string & state_filepath,
