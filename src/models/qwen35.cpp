@@ -3,11 +3,12 @@
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-    // Some quantized GGUFs omit the trailing 0 element; accept 3 or 4 and pad to 4.
-    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 3, false);
-    if (hparams.rope_sections.size() == 3) {
-        hparams.rope_sections.push_back(0);
-    }
+    // Some quantized GGUFs omit the trailing 0 element, producing a 3-element
+    // array [11, 11, 10] instead of [11, 11, 10, 0]. Zero-init first, then
+    // read whatever is present (optional) — get_arr fills min(arr_len, N_MAX)
+    // elements and leaves the rest as 0.
+    hparams.rope_sections = {0, 0, 0, 0};
+    ml.get_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, false);
 
     // Load linear attention (gated delta net) parameters
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
